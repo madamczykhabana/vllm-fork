@@ -10,12 +10,34 @@ import torch
 import torch.nn.functional as F
 from typing import List, Optional, Tuple, Union
 from .attn_bias import AttentionBias, BlockDiagonalCausalMask
+from vllm.hpu.utils import with_mark_steps
 
 try:
     from habana_frameworks.torch.hpex.kernels import FusedSDPA
 except ImportError:
     print("Not using HPU fused scaled dot-product attention kernel.")
     FusedSDPA = None
+
+@with_mark_steps
+def prompt_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_bias: Optional[torch.Tensor] = None,
+    p: float = 0.0,
+    scale: Optional[float] = None,
+) -> torch.Tensor:
+    min_inf = -float("inf")
+    query = query.transpose(1, 2)
+    key = key.transpose(1, 2)
+    value = value.transpose(1, 2)
+    attn_weights = torch.matmul(query * scale, key.transpose(-1, -2))
+    attn_weights.add_(attn_bias)
+    attn_weights = torch.softmax(attn_weights, dim=-1)
+    attn_weights = torch.matmul(attn_weights, value)
+    attn_weights = attn_weights.transpose(1, 2)
+    return attn_weights
+
 
 def memory_efficient_attention_forward(
     query: torch.Tensor,
