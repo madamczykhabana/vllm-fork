@@ -6,6 +6,7 @@ import time
 from enum import IntEnum
 from typing import List, NamedTuple, Optional, Set, Tuple, Dict
 
+import collections
 import os
 import math
 import itertools
@@ -75,6 +76,15 @@ def find_bucket(value: int, config: Tuple[int, int, int]):
     else:
         result = round_up(value, bstep)
     return result
+
+
+def subtuple(obj: object, typename: str, to_copy: List[str], to_override: Dict[str, object] = {}):
+    if obj is None:
+        return None
+    fields = set(to_copy) | set(to_override.keys())
+    values = {f: to_override.get(f, getattr(obj, f)) for f in fields}
+    factory = collections.namedtuple(typename, ' '.join(fields))
+    return factory(**values)
 
 
 class PreparePromptMetadata(NamedTuple):
@@ -693,6 +703,24 @@ class HabanaModelRunner:
                 sampling_metadata, lora_requests, lora_mapping,
                 multi_modal_input)
 
+    def trim_metadata(self, metadata: AttentionMetadata):
+        prefill_metadata = subtuple(metadata.prefill_metadata,
+                                    'TrimmedPrefillMetadata',
+                                    ['block_tables',
+                                     'attn_bias',
+                                     'seq_lens'])
+        decode_metadata = subtuple(metadata.decode_metadata,
+                                   'TrimmedDecodeMetadata',
+                                   ['block_tables',
+                                    'seq_lens_tensor',
+                                    'max_seq_len'])
+        return subtuple(metadata,
+                        'TrimmedMetadata',
+                        ['slot_mapping',
+                         'kv_cache_dtype'],
+                        {'prefill_metadata': prefill_metadata,
+                         'decode_metadata': decode_metadata})
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -724,7 +752,7 @@ class HabanaModelRunner:
             "input_ids": input_tokens,
             "positions": input_positions,
             "kv_caches": kv_caches,
-            "attn_metadata": attn_metadata,
+            "attn_metadata": self.trim_metadata(attn_metadata),
         }
         if self.vision_language_config:
             execute_model_kwargs.update({"image_input": multi_modal_input})

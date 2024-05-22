@@ -217,7 +217,7 @@ class HabanaAttentionImpl(AttentionImpl):
                                      .masked_fill_(mask, -math.inf))
                         if self.sliding_window is not None:
                             raise NotImplementedError("Sliding window is not supported on HPU")
-                        prefill_meta.attn_bias = attn_bias
+                        #prefill_meta.attn_bias = attn_bias
                     else:
                         prefill_meta.attn_bias = _make_alibi_bias(
                             self.alibi_slopes, self.num_kv_heads, batch_size,
