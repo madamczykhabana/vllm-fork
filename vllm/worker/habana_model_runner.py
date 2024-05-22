@@ -36,6 +36,7 @@ logger = init_logger(__name__)
 
 _PAD_SLOT_ID = 0
 LORA_WARMUP_RANK = 8
+_TYPE_CACHE = {}
 
 
 # Read bucketing configuration from env variables
@@ -83,8 +84,9 @@ def subtuple(obj: object, typename: str, to_copy: List[str], to_override: Dict[s
         return None
     fields = set(to_copy) | set(to_override.keys())
     values = {f: to_override.get(f, getattr(obj, f)) for f in fields}
-    factory = collections.namedtuple(typename, ' '.join(fields))
-    return factory(**values)
+    if typename not in _TYPE_CACHE:
+        _TYPE_CACHE[typename] = collections.namedtuple(typename, ' '.join(fields))
+    return _TYPE_CACHE[typename](**values)
 
 
 class PreparePromptMetadata(NamedTuple):
@@ -206,6 +208,7 @@ class HabanaModelRunner:
                 parallel_config=self.parallel_config,
                 scheduler_config=self.scheduler_config,
             )
+        self.model = htorch.hpu.wrap_in_hpu_graph(self.model)
 
         self.model_memory_usage = m.consumed_memory
         logger.info(f"Loading model weights took "
@@ -226,6 +229,11 @@ class HabanaModelRunner:
                 self.lora_config, self.device, self.model.embedding_modules,
                 self.model.embedding_padding_modules)
             self.model = self.lora_manager.create_lora_manager(self.model)
+
+    def use_graphs(self, batch_size, seq_len, is_prompt):
+        if is_prompt:
+            return False
+        return seq_len * batch_size < 26214
 
     def _setup_buckets(self) -> None:
         self.prompt_bs_bucket_cfg = read_bucket_settings('prompt', 'bs', min=1, step=32, max=min(self.max_num_seqs, 64))
@@ -360,7 +368,6 @@ class HabanaModelRunner:
                 slot_mapping[-1].append(slot)
 
         max_query_len = max(query_lens)
-        max_seq_len = max(seq_lens)
         assert max_query_len > 0
 
         context_lens_tensor = torch.tensor(context_lens,
@@ -423,7 +430,6 @@ class HabanaModelRunner:
             seq_lens=seq_lens,
             seq_lens_tensor=seq_lens_tensor,
             max_query_len=max_query_len,
-            max_seq_len=max_seq_len,
             subquery_start_loc=subquery_start_loc,
             seq_start_loc=seq_start_loc,
             context_lens_tensor=context_lens_tensor,
@@ -496,7 +502,6 @@ class HabanaModelRunner:
                     block_table = block_table[-sliding_window_blocks:]
                 block_tables.append(block_table)
 
-        max_seq_len = max(seq_lens)
         input_tokens = torch.tensor(input_tokens,
                                     dtype=torch.long,
                                     device=self.device)
@@ -524,7 +529,6 @@ class HabanaModelRunner:
             seq_lens=None,
             seq_lens_tensor=seq_lens_tensor,
             max_query_len=None,
-            max_seq_len=max_seq_len,
             subquery_start_loc=None,
             seq_start_loc=None,
             context_lens_tensor=None,
@@ -703,23 +707,53 @@ class HabanaModelRunner:
                 sampling_metadata, lora_requests, lora_mapping,
                 multi_modal_input)
 
-    def trim_metadata(self, metadata: AttentionMetadata):
+    def _set_attn_bias(self, prefill_metadata, batch_size, seq_len, device, dtype):
+        if prefill_metadata is None or prefill_metadata.attn_bias is not None:
+            return
+        if True:  # self.alibi_slopes is None:
+            lens = torch.tensor(prefill_metadata.seq_lens, device=device, dtype=torch.int32)
+            len_mask = (torch.arange(0, seq_len, device=device, dtype=torch.int32)
+                        .view(1, seq_len)
+                        .ge(lens.unsqueeze(-1))
+                        .view(batch_size, 1, 1, seq_len))
+            causal_mask = torch.triu(
+                torch.ones((batch_size, 1, seq_len, seq_len), device=device, dtype=torch.bool),
+                diagonal=1
+            )
+            mask = causal_mask.logical_or(len_mask)
+            attn_bias = (torch.zeros_like(mask, dtype=dtype)
+                         .masked_fill_(mask, -math.inf))
+            if self.sliding_window is not None:
+                raise NotImplementedError("Sliding window is not supported on HPU")
+            prefill_metadata.attn_bias = attn_bias
+        else:
+            raise NotImplementedError("Alibi is not supported on HPU")
+            #prefill_meta.attn_bias = _make_alibi_bias(
+            #    self.alibi_slopes, self.num_kv_heads, batch_size,
+            #    seq_len, query.dtype)
+
+    def _trim_metadata(self, metadata: AttentionMetadata) -> object:
         prefill_metadata = subtuple(metadata.prefill_metadata,
                                     'TrimmedPrefillMetadata',
                                     ['block_tables',
-                                     'attn_bias',
-                                     'seq_lens'])
+                                     'attn_bias'])
         decode_metadata = subtuple(metadata.decode_metadata,
                                    'TrimmedDecodeMetadata',
                                    ['block_tables',
                                     'seq_lens_tensor',
-                                    'max_seq_len'])
+                                    ])
         return subtuple(metadata,
                         'TrimmedMetadata',
                         ['slot_mapping',
                          'kv_cache_dtype'],
                         {'prefill_metadata': prefill_metadata,
                          'decode_metadata': decode_metadata})
+
+    def _seq_len(self, attn_metadata):
+        if attn_metadata.prefill_metadata:
+            return attn_metadata.slot_mapping.size(1)
+        else:
+            return attn_metadata.decode_metadata.block_tables.size(1) * self.block_size
 
     @torch.inference_mode()
     def execute_model(
@@ -728,7 +762,6 @@ class HabanaModelRunner:
         kv_caches: List[torch.Tensor],
     ) -> Optional[SamplerOutput]:
         if self.is_driver_worker:
-            # profiler is enabled only for rank == 0 (profiler.py:L57)
             event_start = self.profiler.get_timestamp_us()
             is_prompt = seq_group_metadata_list[0].is_prompt
             base_event_name = 'prompt' if is_prompt else 'decode'
@@ -748,11 +781,18 @@ class HabanaModelRunner:
         if self.lora_config:
             self.set_active_loras(lora_requests, lora_mapping)
 
+        batch_size = input_tokens.size(0)
+        seq_len = self._seq_len(attn_metadata)
+        self._set_attn_bias(attn_metadata.prefill_metadata,
+                            batch_size,
+                            seq_len,
+                            input_tokens.device,
+                            self.model_config.dtype)
         execute_model_kwargs = {
             "input_ids": input_tokens,
             "positions": input_positions,
             "kv_caches": kv_caches,
-            "attn_metadata": self.trim_metadata(attn_metadata),
+            "attn_metadata": self._trim_metadata(attn_metadata),
         }
         if self.vision_language_config:
             execute_model_kwargs.update({"image_input": multi_modal_input})
@@ -763,7 +803,7 @@ class HabanaModelRunner:
         else:
             model_event_name = 'model_executable'
         with self.profiler.record_event('internal', model_event_name):
-            hidden_states = self.model(**execute_model_kwargs)
+            hidden_states = self.model(**execute_model_kwargs, bypass_hpu_graphs=not self.use_graphs(batch_size, seq_len, is_prompt))
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 
         # Compute the logits.
@@ -831,27 +871,29 @@ class HabanaModelRunner:
         self.warmup_scenario(self.max_num_seqs, seq_len, True, kv_caches)
 
     def warmup_scenario(self, batch_size, seq_len, is_prompt, kv_caches) -> None:
+        use_graphs = self.use_graphs(batch_size, seq_len, is_prompt)
         scenario_name = f"warmup_{'prompt' if is_prompt else 'decode'}_bs{batch_size}_seq{seq_len}"
         self.profiler.start('internal', scenario_name)
+        times = 3 if use_graphs else 1
         seqs = [self.create_dummy_seq_group_metadata(i, seq_len, is_prompt) for i in range(batch_size)]
-        _ = self.execute_model(seqs, kv_caches)
+        for _ in range(times):
+            _ = self.execute_model(seqs, kv_caches)
         torch.hpu.synchronize()
         self.profiler.end()
 
     @torch.inference_mode()
     def warmup_model(self, kv_caches: List[torch.Tensor]) -> None:
         self.profiler.start('internal', 'warmup')
-        times = 1  # TODO: this is will be updated once HPU graphs are reintroduced
         scenarios = []
         scenarios.extend(itertools.product(warmup_buckets(self.decode_bs_bucket_cfg), warmup_buckets(self.decode_seq_bucket_cfg), [False]))
         scenarios.extend(itertools.product(warmup_buckets(self.prompt_bs_bucket_cfg), warmup_buckets(self.prompt_seq_bucket_cfg), [True]))
-        scenarios = [scenario for scenario in reversed(scenarios) for _ in range(times) if scenario not in self.excluded_from_warmup]
+        scenarios = [scenario for scenario in reversed(scenarios) if scenario not in self.excluded_from_warmup]
 
         start_mem = HabanaMemoryProfiler.current_memory_usage()
         start_time = time.perf_counter()
         for i, (batch_size, seq_len, is_prompt) in enumerate(scenarios):
             mem_usage = 100.0 * HabanaMemoryProfiler.current_memory_usage() / HabanaMemoryProfiler.total_memory()
-            logger.info(f"[Warmup][{i+1}/{len(scenarios)}] batch_size:{batch_size} seq_len:{seq_len} is_prompt:{is_prompt} mem_usage:{mem_usage:0.1f}%")
+            logger.info(f"[Warmup][{i+1}/{len(scenarios)}] batch_size:{batch_size} seq_len:{seq_len} is_prompt:{is_prompt} use_graphs:{self.use_graphs(batch_size, seq_len, is_prompt)} mem_usage:{mem_usage:0.1f}%")
             self.warmup_scenario(batch_size, seq_len, is_prompt, kv_caches)
         end_time = time.perf_counter()
         end_mem = HabanaMemoryProfiler.current_memory_usage()
