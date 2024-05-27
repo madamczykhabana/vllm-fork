@@ -250,7 +250,6 @@ class HabanaModelRunner:
         # Lazy initialization
         self.lora_manager: LRUCacheWorkerLoRAManager = None
         self.model: torch.nn.Module = None
-        self.excluded_from_warmup = []
 
         self._setup_buckets()
 
@@ -265,6 +264,7 @@ class HabanaModelRunner:
                 parallel_config=self.parallel_config,
                 scheduler_config=self.scheduler_config,
             )
+            # FIXME: Running with disable_tensor_cache=True causes RuntimeErrors. This needs to be debugged
             self.model = htorch.hpu.wrap_in_hpu_graph(HpuModelAdapter(self.model))
 
         self.model_memory_usage = m.consumed_memory
@@ -834,12 +834,14 @@ class HabanaModelRunner:
             (input_tokens, input_positions, attn_metadata, sampling_metadata,
             lora_requests, lora_mapping, multi_modal_input
             ) = self.prepare_input_tensors(seq_group_metadata_list)
+            is_prompt = attn_metadata.prefill_metadata is not None
 
         if self.lora_config:
             self.set_active_loras(lora_requests, lora_mapping)
 
         batch_size = input_tokens.size(0)
         seq_len = self._seq_len(attn_metadata)
+        use_graphs = self._use_graphs(batch_size, seq_len, is_prompt)
         self._set_attn_bias(attn_metadata.prefill_metadata,
                             batch_size,
                             seq_len,
@@ -860,7 +862,7 @@ class HabanaModelRunner:
         else:
             model_event_name = 'model_executable'
         with self.profiler.record_event('internal', model_event_name):
-            hidden_states = self.model.forward(**execute_model_kwargs, selected_token_indices=sampling_metadata.selected_token_indices, bypass_hpu_graphs=not self._use_graphs(batch_size, seq_len, is_prompt))
+            hidden_states = self.model.forward(**execute_model_kwargs, selected_token_indices=sampling_metadata.selected_token_indices, bypass_hpu_graphs=not use_graphs)
 
         # Compute the logits.
         with self.profiler.record_event('internal', 'compute_logits'):
@@ -957,8 +959,6 @@ class HabanaModelRunner:
 
         while True:
             free_mem = HabanaMemoryProfiler.current_free_memory()
-            print(format_bytes(max_prompt_mem_usage), format_bytes(max_decode_mem_usage), format_bytes(free_mem))
-            print(prompt_idx, decode_idx)
             if max_prompt_mem_usage <= max_decode_mem_usage and max_prompt_mem_usage * 2 < free_mem and prompt_idx < len(self.prompt_buckets):
                 batch_size, seq_len = self.prompt_buckets[prompt_idx]
                 self.graphed_buckets.add((batch_size, seq_len, True))
@@ -978,10 +978,10 @@ class HabanaModelRunner:
                 decode_idx += 1
                 continue
             break
-        graphed_prompts = list(sorted(c[:2] for c in self.graphed_buckets if c[2] == True))
-        logger.info(f'Graphed prompts: {graphed_prompts} ({100 * len(graphed_prompts) / len(self.prompt_buckets):.1f}%)')
-        graphed_decodes = list(sorted(c[:2] for c in self.graphed_buckets if c[2] == False))
-        logger.info(f'Graphed decodes: {graphed_decodes} ({100 * len(graphed_decodes) / len(self.decode_buckets):.1f}%)')
+        graphed_prompts = list(c[:2] for c in self.graphed_buckets if c[2] == True)
+        logger.info(f'Graphed prompts: {len(graphed_prompts)} ({100 * len(graphed_prompts) / len(self.prompt_buckets):.1f}%) max_mem_usage: {format_bytes(max_prompt_mem_usage)}')
+        graphed_decodes = list(c[:2] for c in self.graphed_buckets if c[2] == False)
+        logger.info(f'Graphed decodes: {len(graphed_decodes)} ({100 * len(graphed_decodes) / len(self.decode_buckets):.1f}%) max_mem_usage: {format_bytes(max_decode_mem_usage)}')
         
         
     @torch.inference_mode()
