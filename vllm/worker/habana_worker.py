@@ -123,11 +123,14 @@ class HabanaWorker(WorkerBase):
         # of the model.
         self.model_runner.profile_run()
         torch.hpu.synchronize()
+
+        # At this point we should've allocated the maximum workspace for all recipes
+        # we will use the extra memory for graphs/blocks
         free_hpu_memory = torch.hpu.mem_get_info()[0]
 
         cache_block_size = self.get_cache_block_size_bytes()
-        graph_headroom = 0.1
-        num_hpu_blocks = int(free_hpu_memory * (1.0 - graph_headroom) * self.cache_config.gpu_memory_utilization // cache_block_size)
+        graph_headroom = float(os.environ.get('VLLM_GRAPH_HEADROOM', '0.2')) if not self.model_config.enforce_eager else 0.0
+        num_hpu_blocks = int(free_hpu_memory * self.cache_config.gpu_memory_utilization // cache_block_size)
         num_cpu_blocks = int(self.cache_config.swap_space_bytes //
                              cache_block_size)
         num_hpu_blocks = max(num_hpu_blocks, 0)
