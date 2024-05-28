@@ -7,6 +7,7 @@ from enum import IntEnum
 from typing import List, NamedTuple, Optional, Set, Tuple, Dict
 
 import collections
+import gc
 import os
 import math
 import itertools
@@ -19,6 +20,7 @@ from vllm.attention import (AttentionMetadata, AttentionMetadataPerStage,
 from vllm.config import (DeviceConfig, LoadConfig, CacheConfig, LoRAConfig, ModelConfig,
                          ParallelConfig, SchedulerConfig, VisionLanguageConfig)
 from vllm.distributed import broadcast_tensor_dict
+from vllm.distributed.parallel_state import get_cpu_world_group
 from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping
 from vllm.lora.request import LoRARequest
@@ -42,10 +44,11 @@ _TYPE_CACHE = {}
 # Read bucketing configuration from env variables
 # phase is either 'prompt' or 'decode'
 # dim is either 'bs' or 'seq'
-# example env variable: VLLM_DECODE_BS_STEP=128
+# param is either 'min', 'step' or 'max'
+# example env variable: VLLM_DECODE_BS_BUCKET_STEP=128
 def read_bucket_settings(phase: str, dim: str, **defaults: Dict):
     params = ['min', 'step', 'max']
-    values = [os.environ.get(f'VLLM_{phase}_{dim}_BUCKET_{p}'.upper(), defaults[p]) for p in params]
+    values = [int(os.environ.get(f'VLLM_{phase}_{dim}_BUCKET_{p}'.upper(), defaults[p])) for p in params]
     return values
 
 
@@ -94,13 +97,14 @@ def subtuple(obj: object, typename: str, to_copy: List[str], to_override: Dict[s
     return _TYPE_CACHE[typename](**values)
 
 
-def update(cache_tensor, input_tensor):
-    if input_tensor.dim() == 2:
-        cache_tensor[:input_tensor.size(0), :input_tensor.size(1)] = input_tensor
-    elif input_tensor.dim() == 1:
-        cache_tensor[:input_tensor.size(0)] = input_tensor
-    else:
-        raise NotImplementedError("Unsupported number of dims")
+def align_workers(value, op):
+    group = get_cpu_world_group()
+    world_size = torch.distributed.get_world_size()
+    if world_size <= 1:
+        return value
+    value_t = torch.tensor(value, device='cpu')
+    torch.distributed.all_reduce(value_t, op=op, group=group)
+    return value_t.item()
 
 
 class GraphedHpuModel(torch.nn.Module):
@@ -845,7 +849,6 @@ class HabanaModelRunner:
         batch_size = input_tokens.size(0)
         seq_len = self._seq_len(attn_metadata)
         use_graphs = self._use_graphs(batch_size, seq_len, is_prompt)
-        print(is_prompt, batch_size, seq_len, use_graphs)
         self._set_attn_bias(attn_metadata.prefill_metadata,
                             batch_size,
                             seq_len,
@@ -936,14 +939,15 @@ class HabanaModelRunner:
     def warmup_scenario(self, batch_size, seq_len, is_prompt, kv_caches) -> None:
         use_graphs = self.use_graphs(batch_size, seq_len, is_prompt)
         scenario_name = f"warmup_{'prompt' if is_prompt else 'decode'}_bs{batch_size}_seq{seq_len}_graphs{use_graphs}"
-        self.profiler.start('internal', scenario_name)
         times = 3 if use_graphs else 1
         seqs = [self.create_dummy_seq_group_metadata(i, seq_len, is_prompt) for i in range(batch_size)]
+        self.profiler.start('internal', scenario_name)
         torch.hpu.synchronize()
         for _ in range(times):
             self.execute_model(seqs, kv_caches)
             torch.hpu.synchronize()
         self.profiler.end()
+        gc.collect()
 
     def log_warmup(self, phase, i, max_i, batch_size, seq_len):
         free_mem = format_bytes(HabanaMemoryProfiler.current_free_memory())
@@ -980,7 +984,7 @@ class HabanaModelRunner:
             self.log_warmup(phase, idx, num_candidates, batch_size, seq_len)
             with HabanaMemoryProfiler() as mem_prof:
                 self.warmup_scenario(batch_size, seq_len, is_prompt, kv_caches)
-            used_mem = mem_prof.consumed_memory
+            used_mem = align_workers(mem_prof.consumed_memory, torch.distributed.ReduceOp.MAX)
             available_mem -= used_mem
             total_mem += used_mem
             total_batch_seq += batch_seq
@@ -997,12 +1001,16 @@ class HabanaModelRunner:
         self.warmup_all_buckets(self.decode_buckets, False, kv_caches)
 
         if not self.enforce_eager:
-            mem_margin = 1.0 - float(os.environ.get('VLLM_GRAPH_MEM_MARGIN', '0.1'))
+            mem_margin = 1.0 - float(os.environ.get('VLLM_GRAPH_MEM_MARGIN', '0.05'))
+            free_mem = mem_margin * HabanaMemoryProfiler.current_free_memory()
+            free_mem = align_workers(free_mem, torch.distributed.ReduceOp.MIN)
             prompt_graph_mem_ratio = 0.5
+            prompt_available_memory = prompt_graph_mem_ratio * free_mem
+            decode_available_memory = free_mem - prompt_available_memory
             prompt_strategy = 'min_tokens'
             decode_strategy = os.environ.get('VLLM_GRAPH_DECODE_STRATEGY', 'min_tokens')
-            self.warmup_graphs(prompt_strategy, self.prompt_buckets, True, kv_caches, prompt_graph_mem_ratio * mem_margin * HabanaMemoryProfiler.current_free_memory())
-            self.warmup_graphs(decode_strategy, self.decode_buckets, False, kv_caches, mem_margin * HabanaMemoryProfiler.current_free_memory())
+            self.warmup_graphs(prompt_strategy, self.prompt_buckets, True, kv_caches, prompt_available_memory)
+            self.warmup_graphs(decode_strategy, self.decode_buckets, False, kv_caches, decode_available_memory)
 
         end_time = time.perf_counter()
         end_mem = HabanaMemoryProfiler.current_memory_usage()
