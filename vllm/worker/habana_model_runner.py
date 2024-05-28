@@ -233,8 +233,9 @@ class HabanaModelRunner:
                                if model_config is not None else None)
         self.device_config = (device_config
                               if device_config is not None else DeviceConfig())
-        self.device = self.device_config.device
 
+        self.device = self.device_config.device
+        self.enforce_eager = self.model_config.enforce_eager
         self.max_num_seqs = self.scheduler_config.max_num_seqs
         self.max_model_len = self.scheduler_config.max_model_len
         self.max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
@@ -288,6 +289,8 @@ class HabanaModelRunner:
             self.model = self.lora_manager.create_lora_manager(self.model)
 
     def _use_graphs(self, batch_size, seq_len, is_prompt):
+        if self.enforce_eager:
+            return False
         return (batch_size, seq_len, is_prompt) in self.graphed_buckets
 
     def _setup_buckets(self) -> None:
@@ -842,6 +845,7 @@ class HabanaModelRunner:
         batch_size = input_tokens.size(0)
         seq_len = self._seq_len(attn_metadata)
         use_graphs = self._use_graphs(batch_size, seq_len, is_prompt)
+        print(is_prompt, batch_size, seq_len, use_graphs)
         self._set_attn_bias(attn_metadata.prefill_metadata,
                             batch_size,
                             seq_len,
@@ -942,8 +946,8 @@ class HabanaModelRunner:
         self.profiler.end()
 
     def log_warmup(self, phase, i, max_i, batch_size, seq_len):
-        mem_usage = 100.0 * HabanaMemoryProfiler.current_memory_usage() / HabanaMemoryProfiler.total_memory()
-        logger.info(f"[Warmup][{phase}][{i+1}/{max_i}] batch_size:{batch_size} seq_len:{seq_len} mem_usage:{mem_usage:0.1f}%")
+        free_mem = format_bytes(HabanaMemoryProfiler.current_free_memory())
+        logger.info(f"[Warmup][{phase}][{i+1}/{max_i}] batch_size:{batch_size} seq_len:{seq_len} free_mem:{free_mem}")
 
     def warmup_all_buckets(self, buckets, is_prompt, kv_caches):
         for i, (batch_size, seq_len) in enumerate(reversed(buckets)):
@@ -951,37 +955,37 @@ class HabanaModelRunner:
             self.log_warmup('Prompt' if is_prompt else 'Decode', i, len(buckets), batch_size, seq_len)
             self.warmup_scenario(batch_size, seq_len, is_prompt, kv_caches)
 
-    def warmup_graphs(self, kv_caches):
-        max_prompt_mem_usage = 0
-        prompt_idx = 0
-        max_decode_mem_usage = 0
-        decode_idx = 0
+    def warmup_graphs(self, strategy, buckets, is_prompt, kv_caches, available_mem):
+        total_batch_seq = 0.001
+        total_mem = 0
+        idx = 0
+        phase = f'Graph/{"Prompt" if is_prompt else "Decode"}'
+        num_candidates = len(buckets)
 
-        while True:
-            free_mem = HabanaMemoryProfiler.current_free_memory()
-            if max_prompt_mem_usage <= max_decode_mem_usage and max_prompt_mem_usage * 2 < free_mem and prompt_idx < len(self.prompt_buckets):
-                batch_size, seq_len = self.prompt_buckets[prompt_idx]
-                self.graphed_buckets.add((batch_size, seq_len, True))
-                self.log_warmup('Graph/Prompt', prompt_idx, len(self.prompt_buckets), batch_size, seq_len)
-                with HabanaMemoryProfiler() as mem_prof:
-                    self.warmup_scenario(batch_size, seq_len, True, kv_caches)
-                max_prompt_mem_usage = max(max_prompt_mem_usage, mem_prof.consumed_memory)
-                prompt_idx += 1
+        if strategy == 'min_tokens':
+            ordering = lambda b: (b[0] * b[1], b[1], b[0])
+        elif strategy == 'max_bs':
+            ordering = lambda b: (-b[0], b[1])
+        else:
+            raise NotImplementedError(f'Unsupported graph allocation strategy: {strategy}')
+        buckets = list(sorted(buckets, key=ordering))
+
+        for idx, (batch_size, seq_len) in enumerate(buckets):
+            # Graph memory usage is proportional to seq dimension in a batch
+            batch_seq = batch_size * seq_len if is_prompt else batch_size
+            mem_estimate = batch_seq / total_batch_seq * total_mem
+            if mem_estimate >= available_mem:
                 continue
-            if max_decode_mem_usage <= max_prompt_mem_usage and max_decode_mem_usage * 2 < free_mem and decode_idx < len(self.decode_buckets):
-                batch_size, seq_len = self.decode_buckets[decode_idx]
-                self.graphed_buckets.add((batch_size, seq_len, False))
-                self.log_warmup('Graph/Decode', decode_idx, len(self.decode_buckets), batch_size, seq_len)
-                with HabanaMemoryProfiler() as mem_prof:
-                    self.warmup_scenario(batch_size, seq_len, False, kv_caches)
-                max_decode_mem_usage = max(max_decode_mem_usage, mem_prof.consumed_memory)
-                decode_idx += 1
-                continue
-            break
-        graphed_prompts = list(c[:2] for c in self.graphed_buckets if c[2] == True)
-        logger.info(f'Graphed prompts: {len(graphed_prompts)} ({100 * len(graphed_prompts) / len(self.prompt_buckets):.1f}%) max_mem_usage: {format_bytes(max_prompt_mem_usage)}')
-        graphed_decodes = list(c[:2] for c in self.graphed_buckets if c[2] == False)
-        logger.info(f'Graphed decodes: {len(graphed_decodes)} ({100 * len(graphed_decodes) / len(self.decode_buckets):.1f}%) max_mem_usage: {format_bytes(max_decode_mem_usage)}')
+            self.graphed_buckets.add((batch_size, seq_len, is_prompt))
+            self.log_warmup(phase, idx, num_candidates, batch_size, seq_len)
+            with HabanaMemoryProfiler() as mem_prof:
+                self.warmup_scenario(batch_size, seq_len, is_prompt, kv_caches)
+            used_mem = mem_prof.consumed_memory
+            available_mem -= used_mem
+            total_mem += used_mem
+            total_batch_seq += batch_seq
+        graphed = list(c[:2] for c in self.graphed_buckets if c[2] == is_prompt)
+        logger.info(f'{phase} captured:{len(graphed)} ({100 * len(graphed) / num_candidates:.1f}%) used_mem:{format_bytes(total_mem)} buckets:{sorted(list(graphed))}')
         
         
     @torch.inference_mode()
@@ -991,7 +995,14 @@ class HabanaModelRunner:
         start_time = time.perf_counter()
         self.warmup_all_buckets(self.prompt_buckets, True, kv_caches)
         self.warmup_all_buckets(self.decode_buckets, False, kv_caches)
-        self.warmup_graphs(kv_caches)
+
+        if not self.enforce_eager:
+            mem_margin = 1.0 - float(os.environ.get('VLLM_GRAPH_MEM_MARGIN', '0.1'))
+            prompt_graph_mem_ratio = 0.5
+            prompt_strategy = 'min_tokens'
+            decode_strategy = os.environ.get('VLLM_GRAPH_DECODE_STRATEGY', 'min_tokens')
+            self.warmup_graphs(prompt_strategy, self.prompt_buckets, True, kv_caches, prompt_graph_mem_ratio * mem_margin * HabanaMemoryProfiler.current_free_memory())
+            self.warmup_graphs(decode_strategy, self.decode_buckets, False, kv_caches, mem_margin * HabanaMemoryProfiler.current_free_memory())
 
         end_time = time.perf_counter()
         end_mem = HabanaMemoryProfiler.current_memory_usage()
