@@ -129,7 +129,7 @@ class HabanaWorker(WorkerBase):
         free_hpu_memory = torch.hpu.mem_get_info()[0]
 
         cache_block_size = self.get_cache_block_size_bytes()
-        graph_headroom = 1 - (float(os.environ.get('VLLM_GRAPH_RESERVED_MEM', '0.2')) if not self.model_config.enforce_eager else 0)
+        graph_headroom = 1 - (float(os.environ.get('VLLM_GRAPH_RESERVED_MEM', '0.3')) if not self.model_config.enforce_eager else 0)
         num_hpu_blocks = int(free_hpu_memory * graph_headroom * self.cache_config.gpu_memory_utilization // cache_block_size)
         num_cpu_blocks = int(self.cache_config.swap_space_bytes //
                              cache_block_size)
