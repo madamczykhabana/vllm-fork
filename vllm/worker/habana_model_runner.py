@@ -40,6 +40,23 @@ _PAD_SLOT_ID = 0
 LORA_WARMUP_RANK = 8
 _TYPE_CACHE = {}
 
+def setup_profiler():
+    DEVICE='hpu'
+    STEPS=3
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    activities.extend([torch.profiler.ProfilerActivity.HPU] if DEVICE == 'hpu' else [])
+    wait = 0
+    active = 1
+    warmup = STEPS - active
+
+    schedule = torch.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=1)
+    profiler = torch.profiler.profile(
+        schedule=schedule,
+        activities=activities,
+        on_trace_ready=torch.profiler.tensorboard_trace_handler('.', use_gzip=True),
+        record_shapes=False,
+        with_stack=True)
+    return profiler
 
 # Read bucketing configuration from env variables
 # phase is either 'prompt' or 'decode'
@@ -946,17 +963,25 @@ class HabanaModelRunner:
 
         self.warmup_scenario(max_batch_size, max_seq_len, True, kv_caches)
 
-    def warmup_scenario(self, batch_size, seq_len, is_prompt, kv_caches) -> None:
+    def warmup_scenario(self, batch_size, seq_len, is_prompt, kv_caches, profile = False) -> None:
         use_graphs = self._use_graphs(batch_size, seq_len, is_prompt)
         scenario_name = f"warmup_{'prompt' if is_prompt else 'decode'}_bs{batch_size}_seq{seq_len}_graphs{'T' if use_graphs else 'F'}"
-        self.profiler.start('internal', scenario_name)
-        times = 3 if use_graphs else 1
+        times = 3 if use_graphs or profile else 1
         seqs = [self.create_dummy_seq_group_metadata(i, seq_len, is_prompt) for i in range(batch_size)]
         torch.hpu.synchronize()
+        profiler = None
+        if profile and self.is_driver_worker:
+            profiler = setup_profiler()
+            profiler.start()
         for _ in range(times):
+            self.profiler.start('internal', scenario_name)
             self.execute_model(seqs, kv_caches, warmup_mode=True)
             torch.hpu.synchronize()
-        self.profiler.end()
+            self.profiler.end()
+            if profiler:
+                profiler.step()
+        if profiler:
+            profiler.stop()
         gc.collect()
 
     def log_warmup(self, phase, i, max_i, batch_size, seq_len):
@@ -1002,6 +1027,16 @@ class HabanaModelRunner:
 
     @torch.inference_mode()
     def warmup_model(self, kv_caches: List[torch.Tensor]) -> None:
+        if profile := os.environ.get('VLLM_PT_PROFILE', None):
+            phase, bs, seq_len, graphs = profile.split('_')
+            is_prompt = phase == 'prompt'
+            bs = int(bs)
+            seq_len = int(seq_len)
+            graphs = graphs == 't'
+            if graphs:
+                self.graphed_buckets.add((bs, seq_len, is_prompt))
+            self.warmup_scenario(bs, seq_len, is_prompt, kv_caches, True)
+            assert False
         if os.environ.get('VLLM_SKIP_WARMUP', 'false').lower() == 'true':
             logger.info("Skipping warmup...")
             return
