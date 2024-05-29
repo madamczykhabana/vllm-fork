@@ -136,8 +136,42 @@ class HpuModelAdapter():
     def __init__(self, model):
         self.model = model
 
+    def _set_attn_bias(self, attn_metadata, batch_size, seq_len, device, dtype):
+        prefill_metadata = attn_metadata.prefill_metadata
+        if prefill_metadata is None:
+            return attn_metadata
+        #FIXME: Restore alibi support
+        #if self.alibi_slopes is None:
+        if True:
+            seq_lens_t = prefill_metadata.seq_lens_tensor
+            len_mask = (torch.arange(0, seq_len, device=device, dtype=torch.int32)
+                        .view(1, seq_len)
+                        .ge(seq_lens_t.unsqueeze(-1))
+                        .view(batch_size, 1, 1, seq_len))
+            causal_mask = torch.triu(
+                torch.ones((batch_size, 1, seq_len, seq_len), device=device, dtype=torch.bool),
+                diagonal=1
+            )
+            mask = causal_mask.logical_or(len_mask)
+            attn_bias = (torch.zeros_like(mask, dtype=dtype)
+                         .masked_fill_(mask, -math.inf))
+            #FIXME: Restore sliding window support
+            #if self.sliding_window is not None:
+            prefill_metadata = prefill_metadata._replace(attn_bias=attn_bias)
+            attn_metadata = attn_metadata._replace(prefill_metadata=prefill_metadata)
+            return attn_metadata
+        else:
+            # FIXME: This needs updating...
+            prefill_meta.attn_bias = _make_alibi_bias(
+                self.alibi_slopes, self.num_kv_heads, batch_size,
+                seq_len, query.dtype)
+
+
     def forward(self, *args, **kwargs):
+        kwargs = kwargs.copy()
         selected_token_indices = kwargs.pop('selected_token_indices')
+        input_ids = kwargs['input_ids']
+        kwargs['attn_metadata'] = self._set_attn_bias(kwargs['attn_metadata'], input_ids.size(0), input_ids.size(1), input_ids.device, torch.bfloat16)
         hidden_states = self.model(*args, **kwargs)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         hidden_states = hidden_states.index_select(0, selected_token_indices)
@@ -771,31 +805,6 @@ class HabanaModelRunner:
                 sampling_metadata, lora_requests, lora_mapping,
                 multi_modal_input)
 
-    def _set_attn_bias(self, prefill_metadata, batch_size, seq_len, device, dtype):
-        if prefill_metadata is None or prefill_metadata.attn_bias is not None:
-            return
-        if True:  # self.alibi_slopes is None:
-            lens = torch.tensor(prefill_metadata.seq_lens, device=device, dtype=torch.int32)
-            len_mask = (torch.arange(0, seq_len, device=device, dtype=torch.int32)
-                        .view(1, seq_len)
-                        .ge(lens.unsqueeze(-1))
-                        .view(batch_size, 1, 1, seq_len))
-            causal_mask = torch.triu(
-                torch.ones((batch_size, 1, seq_len, seq_len), device=device, dtype=torch.bool),
-                diagonal=1
-            )
-            mask = causal_mask.logical_or(len_mask)
-            attn_bias = (torch.zeros_like(mask, dtype=dtype)
-                         .masked_fill_(mask, -math.inf))
-            if self.sliding_window is not None:
-                raise NotImplementedError("Sliding window is not supported on HPU")
-            prefill_metadata.attn_bias = attn_bias
-        else:
-            raise NotImplementedError("Alibi is not supported on HPU")
-            #prefill_meta.attn_bias = _make_alibi_bias(
-            #    self.alibi_slopes, self.num_kv_heads, batch_size,
-            #    seq_len, query.dtype)
-
     def _seq_len(self, attn_metadata):
         if attn_metadata.prefill_metadata:
             return attn_metadata.slot_mapping.size(1)
@@ -806,6 +815,7 @@ class HabanaModelRunner:
         prefill_metadata = subtuple(metadata.prefill_metadata,
                                     'TrimmedPrefillMetadata',
                                     ['block_tables',
+                                     'seq_lens_tensor',
                                      'attn_bias'])
         decode_metadata = subtuple(metadata.decode_metadata,
                                    'TrimmedDecodeMetadata',
@@ -849,11 +859,6 @@ class HabanaModelRunner:
         batch_size = input_tokens.size(0)
         seq_len = self._seq_len(attn_metadata)
         use_graphs = self._use_graphs(batch_size, seq_len, is_prompt)
-        self._set_attn_bias(attn_metadata.prefill_metadata,
-                            batch_size,
-                            seq_len,
-                            input_tokens.device,
-                            self.model_config.dtype)
         execute_model_kwargs = {
             "input_ids": input_tokens,
             "positions": input_positions,
@@ -1004,7 +1009,7 @@ class HabanaModelRunner:
             mem_margin = 1.0 - float(os.environ.get('VLLM_GRAPH_MEM_MARGIN', '0.05'))
             free_mem = mem_margin * HabanaMemoryProfiler.current_free_memory()
             free_mem = align_workers(free_mem, torch.distributed.ReduceOp.MIN)
-            prompt_graph_mem_ratio = 0.5
+            prompt_graph_mem_ratio = float(os.environ.get('VLLM_GRAPH_PROMPT_RATIO', '0.5'))
             prompt_available_memory = prompt_graph_mem_ratio * free_mem
             decode_available_memory = free_mem - prompt_available_memory
             prompt_strategy = 'min_tokens'
