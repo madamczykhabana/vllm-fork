@@ -107,31 +107,6 @@ def align_workers(value, op):
     return value_t.item()
 
 
-class GraphedHpuModel(torch.nn.Module):
-    def __init__(self, model, max_num_seqs, max_model_len):
-        super().__init__()
-        self.model = model
-        self.max_num_seqs = max_num_seqs
-        self.max_model_len = max_model_len
-        self.input_ids = torch.empty((self.max_num_seqs, self.max_model_len), dtype=torch.int32, device='hpu')
-        self.positions = torch.empty((self.max_num_seqs, self.max_model_len), dtype=torch.int32, device='hpu')
-        self.selected_token_indices = torch.empty((self.max_num_seqs), dtype=torch.int32, device='hpu')
-
-    def forward(self, input_ids_shape, block_tables_shape, is_prompt):
-        hidden_states = self.model(input_ids=self.input_ids[:input_ids_shape[0], :input_ids_shape[1]].clone(),
-                                   positions=self.positions[:input_ids_shape[0], :input_ids_shape[1]].clone(),
-                                   kv_caches=self.kv_caches,
-                                   attn_metadata=self.attn_metadata)
-        hidden_states = hidden_states.index_select(0, self.selected_token_indices[:input_ids_shape[0]].clone())
-        return hidden_states
-
-    def compute_logits(self, *args, **kwargs):
-        return self.model.compute_logits(*args, **kwargs)
-
-    def sample(self, *args, **kwargs):
-        return self.model.sample(*args, **kwargs)
-
-
 class HpuModelAdapter():
     def __init__(self, model):
         self.model = model
