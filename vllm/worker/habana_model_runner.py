@@ -37,13 +37,43 @@ from .profiler import Profiler
 
 logger = init_logger(__name__)
 
+_TYPE_CACHE = {}
 _PAD_SLOT_ID = 0
 LORA_WARMUP_RANK = 8
+
+
+def subtuple(obj: object, typename: str, to_copy: List[str], to_override: Dict[str, object] = {}):
+    if obj is None:
+        return None
+    fields = set(to_copy) | set(to_override.keys())
+    values = {f: to_override.get(f, getattr(obj, f)) for f in fields}
+    if typename not in _TYPE_CACHE:
+        _TYPE_CACHE[typename] = collections.namedtuple(typename, ' '.join(fields))
+    return _TYPE_CACHE[typename](**values)
+
 
 def count_hpu_graphs():
     import glob
     return len(glob.glob('.graph_dumps/*PreGraph*'))
 
+def setup_profiler():
+    DEVICE='hpu'
+    STEPS=3
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    activities.extend([torch.profiler.ProfilerActivity.HPU] if DEVICE == 'hpu' else [])
+    wait = 0
+    active = 1
+    warmup = STEPS - active
+
+    schedule = torch.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=1)
+    profiler = torch.profiler.profile(
+        schedule=schedule,
+        activities=activities,
+        on_trace_ready=torch.profiler.tensorboard_trace_handler('.', use_gzip=True),
+        record_shapes=False,
+        with_stack=True)
+    return profiler
+ 
 # Read bucketing configuration from env variables
 # phase is either 'prompt' or 'decode'
 # dim is either 'bs' or 'blocks'
@@ -145,7 +175,8 @@ class HpuModelAdapter():
             #FIXME: Restore sliding window support
             #if self.sliding_window is not None:
             prefill_metadata = replace(prefill_metadata, attn_bias=attn_bias)
-            return replace(attn_metadata, prefill_metadata=prefill_metadata)
+            attn_metadata = attn_metadata._replace(prefill_metadata=prefill_metadata)
+            return attn_metadata
         else:
             # FIXME: This needs updating...
             prefill_meta.attn_bias = _make_alibi_bias(
@@ -156,6 +187,7 @@ class HpuModelAdapter():
         kwargs = kwargs.copy()
         selected_token_indices = kwargs.pop('selected_token_indices')
         if 'bypass_hpu_graphs' in kwargs:
+            print('bypass:', kwargs['bypass_hpu_graphs'])
             kwargs.pop('bypass_hpu_graphs') # required for PT eager
         input_ids = kwargs['input_ids']
         kwargs['attn_metadata'] = self._set_attn_bias(kwargs['attn_metadata'], input_ids.size(0), input_ids.size(1), input_ids.device, torch.bfloat16)
@@ -786,6 +818,15 @@ class HabanaModelRunner:
         else:
             return attn_metadata.decode_metadata.block_list.numel()
 
+    def trim_attn_metadata(self, metadata: AttentionMetadata) -> object:
+        return subtuple(metadata,
+                        'TrimmedMetadata',
+                        ['slot_mapping',
+                         'kv_cache_dtype',
+                         'prefill_metadata',
+                         'decode_metadata'])
+
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -820,7 +861,7 @@ class HabanaModelRunner:
             "input_ids": input_tokens,
             "positions": input_positions,
             "kv_caches": kv_caches,
-            "attn_metadata": attn_metadata,
+            "attn_metadata": self.trim_attn_metadata(attn_metadata),
         }
         if self.vision_language_config:
             execute_model_kwargs.update({"image_input": multi_modal_input})
@@ -831,7 +872,13 @@ class HabanaModelRunner:
         else:
             model_event_name = 'model_executable'
         free_mem = format_bytes(HabanaMemoryProfiler.current_free_device_memory())
-        print(model_event_name, free_mem, count_hpu_graphs())
+        print(htorch.hpu.input_hash(execute_model_kwargs['attn_metadata']))
+        print(htorch.hpu.input_hash(execute_model_kwargs['attn_metadata'].slot_mapping))
+        print(htorch.hpu.input_hash(execute_model_kwargs['attn_metadata'].kv_cache_dtype))
+        print(htorch.hpu.input_hash(execute_model_kwargs['attn_metadata'].prefill_metadata))
+        print(htorch.hpu.input_hash(execute_model_kwargs['attn_metadata'].decode_metadata))
+        print(execute_model_kwargs['attn_metadata'].decode_metadata)
+        print(model_event_name, free_mem, count_hpu_graphs(), use_graphs)
         with self.profiler.record_event('internal', model_event_name):
             hidden_states = self.model.forward(**execute_model_kwargs, selected_token_indices=sampling_metadata.selected_token_indices, bypass_hpu_graphs=not use_graphs)
 
@@ -902,11 +949,12 @@ class HabanaModelRunner:
 
         self.warmup_scenario(max_batch_size, max_seq_len, True, kv_caches)
 
-    def warmup_scenario(self, batch_size, seq_len, is_prompt, kv_caches) -> None:
+    def warmup_scenario(self, batch_size, seq_len, is_prompt, kv_caches, profile = False) -> None:
         use_graphs = self._use_graphs(batch_size, seq_len, is_prompt)
+        print('use_graphs:', use_graphs)
         scenario_name = f"warmup_{'prompt' if is_prompt else 'decode'}_bs{batch_size}_seq{seq_len}_graphs{'T' if use_graphs else 'F'}"
         self.profiler.start('internal', scenario_name)
-        times = 3 if use_graphs else 1
+        times = 3 if use_graphs or profile else 1
         if is_prompt:
             seqs = [self.create_dummy_seq_group_metadata(i, seq_len, is_prompt) for i in range(batch_size)]
         else:
@@ -915,10 +963,20 @@ class HabanaModelRunner:
             blocks = blocks + [seq_len - len(blocks)]
             seqs = [self.create_dummy_seq_group_metadata(i, b * self.block_size, is_prompt) for i, b in enumerate(blocks)]
         torch.hpu.synchronize()
+        profiler = None
+        if profile and self.is_driver_worker:
+            profiler = setup_profiler()
+            profiler.start()
+        self.profiler.start('internal', scenario_name)
         for _ in range(times):
             self.execute_model(seqs, kv_caches)
             torch.hpu.synchronize()
+            if profiler:
+                profiler.step()
+        if profiler:
+            profiler.stop()
         self.profiler.end()
+        gc.collect()
 
     def log_warmup(self, phase, i, max_i, batch_size, seq_len):
         free_mem = format_bytes(HabanaMemoryProfiler.current_free_device_memory())
@@ -966,6 +1024,16 @@ class HabanaModelRunner:
 
     @torch.inference_mode()
     def warmup_model(self, kv_caches: List[torch.Tensor]) -> None:
+        if profile := os.environ.get('VLLM_PT_PROFILE', None):
+            phase, bs, seq_len, graphs = profile.split('_')
+            is_prompt = phase == 'prompt'
+            bs = int(bs)
+            seq_len = int(seq_len)
+            graphs = graphs == 't'
+            if graphs:
+                self.graphed_buckets.add((bs, seq_len, is_prompt))
+            self.warmup_scenario(bs, seq_len, is_prompt, kv_caches, True)
+            assert False
         if os.environ.get('VLLM_SKIP_WARMUP', 'false').lower() == 'true':
             logger.info("Skipping warmup...")
             return
