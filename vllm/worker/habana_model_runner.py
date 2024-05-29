@@ -942,11 +942,11 @@ class HabanaModelRunner:
         self.warmup_scenario(self.max_num_seqs, seq_len, True, kv_caches)
 
     def warmup_scenario(self, batch_size, seq_len, is_prompt, kv_caches) -> None:
-        use_graphs = self.use_graphs(batch_size, seq_len, is_prompt)
-        scenario_name = f"warmup_{'prompt' if is_prompt else 'decode'}_bs{batch_size}_seq{seq_len}_graphs{use_graphs}"
+        use_graphs = self._use_graphs(batch_size, seq_len, is_prompt)
+        scenario_name = f"warmup_{'prompt' if is_prompt else 'decode'}_bs{batch_size}_seq{seq_len}_graphs{'T' if use_graphs else 'F'}"
+        self.profiler.start('internal', scenario_name)
         times = 3 if use_graphs else 1
         seqs = [self.create_dummy_seq_group_metadata(i, seq_len, is_prompt) for i in range(batch_size)]
-        self.profiler.start('internal', scenario_name)
         torch.hpu.synchronize()
         for _ in range(times):
             self.execute_model(seqs, kv_caches)
