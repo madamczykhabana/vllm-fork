@@ -981,14 +981,14 @@ class HabanaModelRunner:
         self.warmup_all_buckets(self.decode_buckets, False, kv_caches)
 
         if not self.enforce_eager:
-            mem_margin = 1.0 - float(os.environ.get('VLLM_GRAPH_MEM_MARGIN', '0.05'))
+            mem_margin = 1.0 - float(os.environ.get('VLLM_GRAPH_MEM_MARGIN', '0.02'))
             free_mem = mem_margin * HabanaMemoryProfiler.current_free_memory()
             free_mem = align_workers(free_mem, torch.distributed.ReduceOp.MIN)
             prompt_graph_mem_ratio = float(os.environ.get('VLLM_GRAPH_PROMPT_RATIO', '0.5'))
             prompt_available_memory = prompt_graph_mem_ratio * free_mem
             decode_available_memory = free_mem - prompt_available_memory
             prompt_strategy = 'min_tokens'
-            decode_strategy = os.environ.get('VLLM_GRAPH_DECODE_STRATEGY', 'min_tokens')
+            decode_strategy = os.environ.get('VLLM_GRAPH_DECODE_STRATEGY', 'max_bs')
             self.warmup_graphs(prompt_strategy, self.prompt_buckets, True, kv_caches, prompt_available_memory)
             self.warmup_graphs(decode_strategy, self.decode_buckets, False, kv_caches, decode_available_memory)
 
