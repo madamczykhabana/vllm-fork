@@ -13,7 +13,7 @@ from vllm.hpu import cache_ops, ops
 _PARTITION_SIZE = 512
 
 
-@dataclass
+@dataclass(frozen=True)
 class HabanaPagedAttentionMetadata:
     """Metadata for PagedAttention."""
     # (batch_size,). The length of sequences (entire tokens seen so far) per

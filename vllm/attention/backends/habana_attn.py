@@ -57,58 +57,10 @@ class HabanaAttentionBackend(AttentionBackend):
         HabanaPagedAttention.copy_blocks(kv_caches, src_to_dists)
 
 
-@dataclass
-class HabanaAttentionMetadata(AttentionMetadataPerStage, HabanaPagedAttentionMetadata):
-    """Metadata for HabanaAttentionbackend.
-
-    NOTE: Any python object stored here is not updated when it is
-    cuda-graph replayed. If you have values that need to be changed
-    dynamically, it should be stored in tensor. The tensor has to be
-    updated from `CUDAGraphRunner.forward` API.
-    """
-    # Currently, input sequences can only contain all prompts
-    # or all decoding. True if all sequences are prompts.
-    is_prompt: bool
-    # (batch_size,). The sequence length per sequence. Sequence length means
-    # the computed tokens + new tokens None if it is a decoding.
-    seq_lens: Optional[List[int]]
-    # seq_lens stored as a tensor.
-    seq_lens_tensor: Optional[torch.Tensor]
-
-    # |---------- N-1 iteration --------|
-    # |---------------- N iteration ---------------------|
-    # |- tokenA -|......................|-- newTokens ---|
-    # |---------- context_len ----------|
-    # |-------------------- seq_len ----------------------|
-    #                                   |-- query_len ---|
-
-    # Maximum query length in the batch.
-    max_query_len: Optional[int]
-    # (batch_size + 1,). The cumulative subquery lengths of the sequences in
-    # the batch, used to index into subquery. E.g., if the subquery length
-    # is [4, 6], it is [0, 4, 10].
-    subquery_start_loc: Optional[torch.Tensor]
-    # FIXME: It is for flash attn.
-    # (batch_size + 1,). The cumulative sequence lengths of the sequences in
-    # the batch, used to index into sequence. E.g., if the sequence length is
-    # [4, 6], it is [0, 4, 10].
-    seq_start_loc: Optional[torch.Tensor]
-    # (batch_size,) A tensor of context lengths (tokens that are computed
-    # so far).
-    context_lens_tensor: Optional[torch.Tensor]
-
-    # Whether or not if cuda graph is enabled.
-    # Cuda-graph is currently enabled for decoding only.
-    # TODO(woosuk): Move `use_cuda_graph` out since it's unrelated to attention.
-    use_cuda_graph: bool
-
-    def __post_init__(self):
-        # Set during the execution of the first attention op.
-        # It is a list because it is needed to set per prompt
-        # when alibi slopes is used. It is because of the limitation
-        # from xformer API.
-        # will not appear in the __repr__ and __init__
-        self.attn_bias: Optional[List[AttentionBias]] = None
+@dataclass(frozen=True)
+class HabanaAttentionMetadata(HabanaPagedAttentionMetadata, AttentionMetadataPerStage):
+    """Metadata for HabanaAttentionbackend."""
+    attn_bias: Optional[torch.Tensor]
 
 
 class HabanaAttentionImpl(AttentionImpl):

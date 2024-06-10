@@ -4,6 +4,7 @@
 
 import time
 from enum import IntEnum
+from dataclasses import dataclass, replace
 from typing import List, NamedTuple, Optional, Set, Tuple, Dict
 
 import collections
@@ -38,7 +39,6 @@ logger = init_logger(__name__)
 
 _PAD_SLOT_ID = 0
 LORA_WARMUP_RANK = 8
-_TYPE_CACHE = {}
 
 
 # Read bucketing configuration from env variables
@@ -87,16 +87,6 @@ def find_bucket(value: int, config: Tuple[int, int, int]):
     return result
 
 
-def subtuple(obj: object, typename: str, to_copy: List[str], to_override: Dict[str, object] = {}):
-    if obj is None:
-        return None
-    fields = set(to_copy) | set(to_override.keys())
-    values = {f: to_override.get(f, getattr(obj, f)) for f in fields}
-    if typename not in _TYPE_CACHE:
-        _TYPE_CACHE[typename] = collections.namedtuple(typename, ' '.join(fields))
-    return _TYPE_CACHE[typename](**values)
-
-
 def align_workers(value, op):
     group = get_cpu_world_group()
     world_size = torch.distributed.get_world_size()
@@ -132,15 +122,13 @@ class HpuModelAdapter():
                          .masked_fill_(mask, -math.inf))
             #FIXME: Restore sliding window support
             #if self.sliding_window is not None:
-            prefill_metadata = prefill_metadata._replace(attn_bias=attn_bias)
-            attn_metadata = attn_metadata._replace(prefill_metadata=prefill_metadata)
-            return attn_metadata
+            prefill_metadata = replace(prefill_metadata, attn_bias=attn_bias)
+            return replace(attn_metadata, prefill_metadata=prefill_metadata)
         else:
             # FIXME: This needs updating...
             prefill_meta.attn_bias = _make_alibi_bias(
                 self.alibi_slopes, self.num_kv_heads, batch_size,
                 seq_len, query.dtype)
-
 
     def forward(self, *args, **kwargs):
         kwargs = kwargs.copy()
@@ -219,6 +207,11 @@ class BatchType(IntEnum):
     DECODE = 1
     # Batch is a mixture of prefill and decode.
     MIXED = 2
+
+
+@dataclass(unsafe_hash=True)
+class HashableAttentionMetadata(AttentionMetadata):
+    ...
 
 
 class HabanaModelRunner:
@@ -449,10 +442,6 @@ class HabanaModelRunner:
         max_query_len = max(query_lens)
         assert max_query_len > 0
 
-        context_lens_tensor = torch.tensor(context_lens,
-                                           dtype=torch.int,
-                                           device=self.device)
-
         if multi_modal_input_list:
             assert self.vision_language_config, (
                 "Multi-modal inputs are only supported by "
@@ -488,32 +477,14 @@ class HabanaModelRunner:
                                             pad=0,
                                             dtype=torch.int,
                                             device=self.device)
-
-        # Query length can be shorter than key (i.e., prompt) when prefill
-        # is chunked or prefix cached.
-        query_lens_tensor = torch.tensor(query_lens,
-                                         dtype=torch.long,
-                                         device=self.device)
-        subquery_start_loc = torch.zeros(query_lens_tensor.shape[0] + 1,
-                                         dtype=torch.int32,
-                                         device=self.device)
         seq_lens_tensor = torch.tensor(seq_lens,
                                        dtype=torch.long,
                                        device=self.device)
-        seq_start_loc = torch.zeros(seq_lens_tensor.shape[0] + 1,
-                                    dtype=torch.int32,
-                                    device=self.device)
 
         attn_metadata = self.attn_backend.make_metadata(
-            is_prompt=True,
-            seq_lens=seq_lens,
-            seq_lens_tensor=seq_lens_tensor,
-            max_query_len=max_query_len,
-            subquery_start_loc=subquery_start_loc,
-            seq_start_loc=seq_start_loc,
-            context_lens_tensor=context_lens_tensor,
             block_tables=block_tables,
-            use_cuda_graph=False,
+            seq_lens_tensor=seq_lens_tensor,
+            attn_bias=None,
         )
         return PreparePromptMetadata(
             input_tokens=input_tokens,
@@ -604,15 +575,9 @@ class HabanaModelRunner:
             device=self.device,
         )
         attn_metadata = self.attn_backend.make_metadata(
-            is_prompt=False,
-            seq_lens=None,
-            seq_lens_tensor=seq_lens_tensor,
-            max_query_len=None,
-            subquery_start_loc=None,
-            seq_start_loc=None,
-            context_lens_tensor=None,
             block_tables=block_tables,
-            use_cuda_graph=False,
+            seq_lens_tensor=seq_lens_tensor,
+            attn_bias=None,
         )
         return PrepareDecodeMetadata(
             input_tokens=input_tokens,
@@ -772,7 +737,7 @@ class HabanaModelRunner:
                 decode_attn_metadata = self.attn_backend.make_metadata(
                     **metadata_dict)
 
-        attn_metadata = AttentionMetadata(
+        attn_metadata = HashableAttentionMetadata(
             num_prefills=num_prefills,
             slot_mapping=slot_mapping,
             num_prefill_tokens=num_prefill_tokens,
@@ -791,24 +756,6 @@ class HabanaModelRunner:
             return attn_metadata.slot_mapping.size(1)
         else:
             return attn_metadata.decode_metadata.block_tables.size(1) * self.block_size
-
-    def trim_attn_metadata(self, metadata: AttentionMetadata) -> object:
-        prefill_metadata = subtuple(metadata.prefill_metadata,
-                                    'TrimmedPrefillMetadata',
-                                    ['block_tables',
-                                     'seq_lens_tensor',
-                                     'attn_bias'])
-        decode_metadata = subtuple(metadata.decode_metadata,
-                                   'TrimmedDecodeMetadata',
-                                   ['block_tables',
-                                    'seq_lens_tensor',
-                                    ])
-        return subtuple(metadata,
-                        'TrimmedMetadata',
-                        ['slot_mapping',
-                         'kv_cache_dtype'],
-                        {'prefill_metadata': prefill_metadata,
-                         'decode_metadata': decode_metadata})
 
     @torch.inference_mode()
     def execute_model(
@@ -844,7 +791,7 @@ class HabanaModelRunner:
             "input_ids": input_tokens,
             "positions": input_positions,
             "kv_caches": kv_caches,
-            "attn_metadata": self.trim_attn_metadata(attn_metadata),
+            "attn_metadata": attn_metadata,
         }
         if self.vision_language_config:
             execute_model_kwargs.update({"image_input": multi_modal_input})
