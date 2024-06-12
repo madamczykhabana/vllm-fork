@@ -40,10 +40,9 @@ logger = init_logger(__name__)
 _PAD_SLOT_ID = 0
 LORA_WARMUP_RANK = 8
 
-
 # Read bucketing configuration from env variables
 # phase is either 'prompt' or 'decode'
-# dim is either 'bs' or 'seq'
+# dim is either 'bs' or 'blocks'
 # param is either 'min', 'step' or 'max'
 # example env variable: VLLM_DECODE_BS_BUCKET_STEP=128
 def read_bucket_settings(phase: str, dim: str, **defaults: Dict):
@@ -61,9 +60,21 @@ def warmup_range(config: Tuple[int, int, int]):
     return list(ramp_up) + list(stable)
 
 
-def warmup_buckets(bs_bucket_config, seq_bucket_config):
+def generate_prompt_buckets(bs_bucket_config, seq_bucket_config):
     buckets = itertools.product(warmup_range(bs_bucket_config), warmup_range(seq_bucket_config))
     return list(sorted(buckets, key=lambda b: (b[0] * b[1], b[1], b[0])))
+
+
+def generate_decode_buckets(bs_bucket_config, blocks_bucket_config, max_blocks):
+    buckets = []
+    for bs in warmup_range(bs_bucket_config):
+        for blocks in warmup_range(blocks_bucket_config):
+            if blocks < bs:
+                continue
+            if blocks > max_blocks:
+                break
+            buckets.append((bs, blocks))
+    return buckets
 
 
 def next_pow2(value: int):
@@ -95,6 +106,12 @@ def align_workers(value, op):
     value_t = torch.tensor(value, device='cpu')
     torch.distributed.all_reduce(value_t, op=op, group=group)
     return value_t.item()
+
+
+def pad_list(l, k, v):
+    target_len = round_up(len(l), k)
+    padding = target_len - len(l)
+    return l + [v] * padding
 
 
 class HpuModelAdapter():
@@ -306,19 +323,14 @@ class HabanaModelRunner:
         return (batch_size, seq_len, is_prompt) in self.graphed_buckets
 
     def _setup_buckets(self) -> None:
-        self.prompt_bs_bucket_cfg = read_bucket_settings('prompt', 'bs', min=1, step=32, max=min(self.max_num_seqs, 64))
-        self.decode_bs_bucket_cfg = read_bucket_settings('decode', 'bs', min=1, step=128, max=self.max_num_seqs)
+        align_bs = lambda x: min(self.max_num_seqs, x)
+        self.prompt_bs_bucket_cfg = read_bucket_settings('prompt', 'bs', min=1, step=align_bs(32), max=align_bs(64))
+        self.decode_bs_bucket_cfg = read_bucket_settings('decode', 'bs', min=align_bs(32), step=align_bs(32), max=self.max_num_seqs)
         self.prompt_seq_bucket_cfg = read_bucket_settings('prompt', 'seq', min=self.block_size, step=self.block_size, max=1024)
-        self.decode_seq_bucket_cfg = read_bucket_settings('decode', 'seq', min=self.block_size, step=self.block_size, max=2048)
+        self.decode_block_bucket_cfg = read_bucket_settings('decode', 'seq', min=16, step=16, max=self.max_num_seqs * 2048 // self.block_size)
         self.graphed_buckets = set()
-
         logger.info(f"Prompt bucket config (min, step, max_warmup) bs:{self.prompt_bs_bucket_cfg}, seq:{self.prompt_seq_bucket_cfg}")
-        self.prompt_buckets = warmup_buckets(self.prompt_bs_bucket_cfg, self.prompt_seq_bucket_cfg)
-        logger.info(f"Generated {len(self.prompt_buckets)} prompt buckets: {list(sorted(self.prompt_buckets))}")
-
-        logger.info(f"Decode bucket config (min, step, max_warmup) bs:{self.decode_bs_bucket_cfg}, seq:{self.decode_seq_bucket_cfg}")
-        self.decode_buckets = warmup_buckets(self.decode_bs_bucket_cfg, self.decode_seq_bucket_cfg)
-        logger.info(f"Generated {len(self.decode_buckets)} decode buckets: {list(sorted(self.decode_buckets))}")
+        logger.info(f"Decode bucket config (min, step, max_warmup) bs:{self.decode_bs_bucket_cfg}, seq:{self.decode_block_bucket_cfg}")
 
     def _prepare_prompt(
         self,
@@ -573,10 +585,16 @@ class HabanaModelRunner:
         for sl, bu in zip(seq_lens, blocks_used):
             for i in range(bu):
                 block_masks.append([i * self.block_size + j >= sl for j in range(self.block_size)])
+        ignored_block = [True] * self.block_size
+
+        block_list = pad_list(block_list, 16, _PAD_SLOT_ID)
+        block_mapping = pad_list(block_mapping, 16, 0)
+        block_masks = pad_list(block_masks, 16, ignored_block)
 
         block_list = torch.tensor(block_list, dtype=torch.int, device=self.device)
         block_mapping = torch.tensor(block_mapping, dtype=torch.int, device=self.device)
         block_masks = torch.tensor(block_masks, dtype=torch.bool, device=self.device).view(-1, self.block_size)
+
         attn_metadata = self.attn_backend.make_metadata(
             block_list=block_list,
             block_mapping=block_mapping,
@@ -760,7 +778,7 @@ class HabanaModelRunner:
         if attn_metadata.prefill_metadata:
             return attn_metadata.slot_mapping.size(1)
         else:
-            return attn_metadata.decode_metadata.block_list.numel() * self.block_size
+            return attn_metadata.decode_metadata.block_list.numel()
 
     @torch.inference_mode()
     def execute_model(
@@ -806,6 +824,8 @@ class HabanaModelRunner:
             model_event_name = f"model_{'prompt' if is_prompt else 'decode'}_bs{batch_size}_seq{seq_len}_graphs{'T' if use_graphs else 'F'}"
         else:
             model_event_name = 'model_executable'
+        free_mem = format_bytes(HabanaMemoryProfiler.current_free_device_memory())
+        print(model_event_name, free_mem)
         with self.profiler.record_event('internal', model_event_name):
             hidden_states = self.model.forward(**execute_model_kwargs, selected_token_indices=sampling_metadata.selected_token_indices, bypass_hpu_graphs=not use_graphs)
 
@@ -881,7 +901,13 @@ class HabanaModelRunner:
         scenario_name = f"warmup_{'prompt' if is_prompt else 'decode'}_bs{batch_size}_seq{seq_len}_graphs{'T' if use_graphs else 'F'}"
         self.profiler.start('internal', scenario_name)
         times = 3 if use_graphs else 1
-        seqs = [self.create_dummy_seq_group_metadata(i, seq_len, is_prompt) for i in range(batch_size)]
+        if is_prompt:
+            seqs = [self.create_dummy_seq_group_metadata(i, seq_len, is_prompt) for i in range(batch_size)]
+        else:
+            # FIXME: seq_len is actually number of blocks
+            blocks = [1 for _ in range(batch_size - 1)]
+            blocks = blocks + [seq_len - len(blocks)]
+            seqs = [self.create_dummy_seq_group_metadata(i, b * self.block_size, is_prompt) for i, b in enumerate(blocks)]
         torch.hpu.synchronize()
         for _ in range(times):
             self.execute_model(seqs, kv_caches)
@@ -929,6 +955,8 @@ class HabanaModelRunner:
             total_mem += used_mem
             total_batch_seq += batch_seq
         graphed = list(c[:2] for c in self.graphed_buckets if c[2] == is_prompt)
+        if num_candidates == 0:
+            num_candidates = 1
         logger.info(f'{phase} captured:{len(graphed)} ({100 * len(graphed) / num_candidates:.1f}%) used_mem:{format_bytes(total_mem)} buckets:{sorted(list(graphed))}')
 
     @torch.inference_mode()
@@ -937,6 +965,14 @@ class HabanaModelRunner:
             logger.info("Skipping warmup...")
             return
         self.profiler.start('internal', 'warmup')
+        max_blocks = kv_caches[0][0].size(0)
+
+        self.prompt_buckets = generate_prompt_buckets(self.prompt_bs_bucket_cfg, self.prompt_seq_bucket_cfg)
+        logger.info(f"Generated {len(self.prompt_buckets)} prompt buckets: {list(sorted(self.prompt_buckets))}")
+
+        self.decode_buckets = generate_decode_buckets(self.decode_bs_bucket_cfg, self.decode_block_bucket_cfg, max_blocks)
+        logger.info(f"Generated {len(self.decode_buckets)} decode buckets: {list(sorted(self.decode_buckets))}")
+
         start_mem = HabanaMemoryProfiler.current_device_memory_usage()
         start_time = time.perf_counter()
         self.warmup_all_buckets(self.prompt_buckets, True, kv_caches)
