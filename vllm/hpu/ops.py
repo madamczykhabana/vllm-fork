@@ -77,6 +77,36 @@ def paged_attention_v1(query, key_cache, value_cache, head_mapping, scale, block
     return attn_weights.squeeze(-2)
 
 
+def block_reduce(batch_size, tensor, block_mapping):
+    sums = torch.zeros(batch_size, *tensor.shape[1:], dtype=tensor.dtype, device=tensor.device)
+    sums.index_put_((block_mapping,), tensor, accumulate=True)
+    return sums
+
+
+def block_softmax(batch_size, attn, block_mapping):
+    attn = attn.exp_()
+    sums = block_reduce(batch_size, attn.sum(dim=-1).unsqueeze(-1), block_mapping)
+    sums = torch.index_select(sums, 0, block_mapping)
+    attn.div_(sums)
+    return attn
+
+
+@hpu_utils.with_mark_steps
+def flat_pa(query, key_cache, value_cache, block_list, block_mapping, block_masks, scale):
+    batch_size = query.size(0)
+    query = scale * torch.index_select(query, 0, block_mapping).unsqueeze(-2)
+    key = torch.index_select(key_cache, 0, block_list).permute(0, 2, 3, 1)
+    value = torch.index_select(value_cache, 0, block_list).permute(0, 2, 1, 3)
+    min_inf = torch.finfo(query.dtype).min
+    attn = query @ key
+    attn.masked_fill_(block_masks.view(key.size(0), 1, 1, -1), min_inf)
+    attn = block_softmax(batch_size, attn, block_mapping)
+    attn = attn @ value
+    attn = block_reduce(batch_size, attn, block_mapping)
+    attn = attn.squeeze(-2)
+    return attn
+
+
 def rms_norm(out, hidden_states, weight, eps):
     htorch.core.mark_step()
     input_dtype = hidden_states.dtype

@@ -472,19 +472,16 @@ class HabanaModelRunner:
                                             dtype=torch.long,
                                             device=self.device)
 
-        block_tables = make_tensor_with_pad(prefix_block_tables,
-                                            max_len=max_prompt_block_table_len,
-                                            pad=0,
-                                            dtype=torch.int,
-                                            device=self.device)
         seq_lens_tensor = torch.tensor(seq_lens,
                                        dtype=torch.long,
                                        device=self.device)
 
         attn_metadata = self.attn_backend.make_metadata(
-            block_tables=block_tables,
-            seq_lens_tensor=seq_lens_tensor,
+            block_list=None,
+            block_mapping=None,
+            block_masks=None,
             attn_bias=None,
+            seq_lens_tensor=seq_lens_tensor,
         )
         return PreparePromptMetadata(
             input_tokens=input_tokens,
@@ -565,19 +562,27 @@ class HabanaModelRunner:
                                        dtype=torch.int,
                                        device=self.device)
 
-        max_block_table_len = max(
-            len(block_table) for block_table in block_tables)
-        block_tables = make_tensor_with_pad(
-            block_tables,
-            max_len=max_block_table_len,
-            pad=0,
-            dtype=torch.int,
-            device=self.device,
-        )
+        # FIXME: allow seq_len padding
+        blocks_used = list(itertools.chain(round_up(s, self.block_size) // self.block_size for s in seq_lens))
+
+        block_masks = []
+        block_list = list(itertools.chain(*block_tables))
+        block_mapping = [[i] * bu for i, bu in enumerate(blocks_used)]
+        block_mapping = list(itertools.chain(*block_mapping))
+
+        for sl, bu in zip(seq_lens, blocks_used):
+            for i in range(bu):
+                block_masks.append([i * self.block_size + j >= sl for j in range(self.block_size)])
+
+        block_list = torch.tensor(block_list, dtype=torch.int, device=self.device)
+        block_mapping = torch.tensor(block_mapping, dtype=torch.int, device=self.device)
+        block_masks = torch.tensor(block_masks, dtype=torch.bool, device=self.device).view(-1, self.block_size)
         attn_metadata = self.attn_backend.make_metadata(
-            block_tables=block_tables,
-            seq_lens_tensor=seq_lens_tensor,
+            block_list=block_list,
+            block_mapping=block_mapping,
+            block_masks=block_masks,
             attn_bias=None,
+            seq_lens_tensor=seq_lens_tensor,
         )
         return PrepareDecodeMetadata(
             input_tokens=input_tokens,
@@ -755,7 +760,7 @@ class HabanaModelRunner:
         if attn_metadata.prefill_metadata:
             return attn_metadata.slot_mapping.size(1)
         else:
-            return attn_metadata.decode_metadata.block_tables.size(1) * self.block_size
+            return attn_metadata.decode_metadata.block_list.numel() * self.block_size
 
     @torch.inference_mode()
     def execute_model(

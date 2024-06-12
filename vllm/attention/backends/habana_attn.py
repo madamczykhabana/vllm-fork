@@ -61,6 +61,7 @@ class HabanaAttentionBackend(AttentionBackend):
 class HabanaAttentionMetadata(HabanaPagedAttentionMetadata, AttentionMetadataPerStage):
     """Metadata for HabanaAttentionbackend."""
     attn_bias: Optional[torch.Tensor]
+    seq_lens_tensor: Optional[torch.Tensor]
 
 
 class HabanaAttentionImpl(AttentionImpl):
@@ -148,7 +149,8 @@ class HabanaAttentionImpl(AttentionImpl):
 
         if prefill_meta := attn_metadata.prefill_metadata:
             # Prompt run.
-            if kv_cache is None or prefill_meta.block_tables.numel() == 0:
+            # FIXME!
+            if True:
                 # TODO: move this outside of model
                 assert prefill_meta.attn_bias is not None, 'attn_bias must be set before calling model.forward!'
                 query_shape = (batch_size, seq_len, self.num_heads, self.head_size)
@@ -180,16 +182,13 @@ class HabanaAttentionImpl(AttentionImpl):
         if decode_meta := attn_metadata.decode_metadata:
             # Decoding run.
             output = HabanaPagedAttention.forward_decode(
-                query,
-                key_cache,
-                value_cache,
-                decode_meta.block_tables,
-                decode_meta.seq_lens_tensor,
-                attn_metadata.kv_cache_dtype,
-                self.num_kv_heads,
-                self.scale,
-                self.alibi_slopes,
-                kv_scale
+                query=query,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                block_list=decode_meta.block_list,
+                block_mapping=decode_meta.block_mapping,
+                block_masks=decode_meta.block_masks,
+                scale=self.scale,
             )
 
         # Reshape the output tensor.
