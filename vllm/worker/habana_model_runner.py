@@ -40,6 +40,10 @@ logger = init_logger(__name__)
 _PAD_SLOT_ID = 0
 LORA_WARMUP_RANK = 8
 
+def count_hpu_graphs():
+    import glob
+    return len(glob.glob('.graph_dumps/*PreGraph*'))
+
 # Read bucketing configuration from env variables
 # phase is either 'prompt' or 'decode'
 # dim is either 'bs' or 'blocks'
@@ -56,9 +60,10 @@ def warmup_range(config: Tuple[int, int, int]):
     base = itertools.repeat(2)
     ramp_up = itertools.accumulate(base, func=operator.mul, initial=bmin)
     ramp_up = itertools.takewhile(lambda x: x < bstep and x <= bmax, ramp_up)
-    stable = range(bstep, bmax + 1, bstep)
-    return list(ramp_up) + list(stable)
-
+    stable = range(max(bmin, bstep), bmax + 1, bstep)
+    ramp_up = list(ramp_up)
+    stable = list(stable)
+    return ramp_up + stable
 
 def generate_prompt_buckets(bs_bucket_config, seq_bucket_config):
     buckets = itertools.product(warmup_range(bs_bucket_config), warmup_range(seq_bucket_config))
@@ -74,7 +79,7 @@ def generate_decode_buckets(bs_bucket_config, blocks_bucket_config, max_blocks):
             if blocks > max_blocks:
                 break
             buckets.append((bs, blocks))
-    return buckets
+    return list(sorted(buckets, key=lambda b: (b[0] * b[1], b[1], b[0])))
 
 
 def next_pow2(value: int):
@@ -327,7 +332,7 @@ class HabanaModelRunner:
         self.prompt_bs_bucket_cfg = read_bucket_settings('prompt', 'bs', min=1, step=align_bs(32), max=align_bs(64))
         self.decode_bs_bucket_cfg = read_bucket_settings('decode', 'bs', min=align_bs(32), step=align_bs(32), max=self.max_num_seqs)
         self.prompt_seq_bucket_cfg = read_bucket_settings('prompt', 'seq', min=self.block_size, step=self.block_size, max=1024)
-        self.decode_block_bucket_cfg = read_bucket_settings('decode', 'seq', min=16, step=16, max=self.max_num_seqs * 2048 // self.block_size)
+        self.decode_block_bucket_cfg = read_bucket_settings('decode', 'block', min=32, step=32, max=self.max_num_seqs * 2048 // self.block_size)
         self.graphed_buckets = set()
         logger.info(f"Prompt bucket config (min, step, max_warmup) bs:{self.prompt_bs_bucket_cfg}, seq:{self.prompt_seq_bucket_cfg}")
         logger.info(f"Decode bucket config (min, step, max_warmup) bs:{self.decode_bs_bucket_cfg}, seq:{self.decode_block_bucket_cfg}")
@@ -587,9 +592,10 @@ class HabanaModelRunner:
                 block_masks.append([i * self.block_size + j >= sl for j in range(self.block_size)])
         ignored_block = [True] * self.block_size
 
-        block_list = pad_list(block_list, 16, _PAD_SLOT_ID)
-        block_mapping = pad_list(block_mapping, 16, 0)
-        block_masks = pad_list(block_masks, 16, ignored_block)
+        block_bucket_size = self.decode_block_bucket_cfg[1]
+        block_list = pad_list(block_list, block_bucket_size, _PAD_SLOT_ID)
+        block_mapping = pad_list(block_mapping, block_bucket_size, 0)
+        block_masks = pad_list(block_masks, block_bucket_size, ignored_block)
 
         block_list = torch.tensor(block_list, dtype=torch.int, device=self.device)
         block_mapping = torch.tensor(block_mapping, dtype=torch.int, device=self.device)
@@ -825,7 +831,7 @@ class HabanaModelRunner:
         else:
             model_event_name = 'model_executable'
         free_mem = format_bytes(HabanaMemoryProfiler.current_free_device_memory())
-        print(model_event_name, free_mem)
+        print(model_event_name, free_mem, count_hpu_graphs())
         with self.profiler.record_event('internal', model_event_name):
             hidden_states = self.model.forward(**execute_model_kwargs, selected_token_indices=sampling_metadata.selected_token_indices, bypass_hpu_graphs=not use_graphs)
 
@@ -913,7 +919,6 @@ class HabanaModelRunner:
             self.execute_model(seqs, kv_caches)
             torch.hpu.synchronize()
         self.profiler.end()
-        gc.collect()
 
     def log_warmup(self, phase, i, max_i, batch_size, seq_len):
         free_mem = format_bytes(HabanaMemoryProfiler.current_free_device_memory())
@@ -975,8 +980,8 @@ class HabanaModelRunner:
 
         start_mem = HabanaMemoryProfiler.current_device_memory_usage()
         start_time = time.perf_counter()
-        self.warmup_all_buckets(self.prompt_buckets, True, kv_caches)
         self.warmup_all_buckets(self.decode_buckets, False, kv_caches)
+        self.warmup_all_buckets(self.prompt_buckets, True, kv_caches)
 
         if not self.enforce_eager:
             mem_margin = 1.0 - float(os.environ.get('VLLM_GRAPH_MEM_MARGIN', '0.02'))
