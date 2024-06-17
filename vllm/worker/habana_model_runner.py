@@ -187,7 +187,6 @@ class HpuModelAdapter():
         kwargs = kwargs.copy()
         selected_token_indices = kwargs.pop('selected_token_indices')
         if 'bypass_hpu_graphs' in kwargs:
-            print('bypass:', kwargs['bypass_hpu_graphs'])
             kwargs.pop('bypass_hpu_graphs') # required for PT eager
         input_ids = kwargs['input_ids']
         kwargs['attn_metadata'] = self._set_attn_bias(kwargs['attn_metadata'], input_ids.size(0), input_ids.size(1), input_ids.device, torch.bfloat16)
@@ -610,22 +609,21 @@ class HabanaModelRunner:
         slot_mapping = torch.tensor(slot_mapping,
                                     dtype=torch.long,
                                     device=self.device)
-        seq_lens_tensor = torch.tensor(seq_lens,
-                                       dtype=torch.int,
-                                       device=self.device)
 
-        # FIXME: allow seq_len padding
         blocks_used = list(itertools.chain(round_up(s, self.block_size) // self.block_size for s in seq_lens))
-
         block_masks = []
         block_list = list(itertools.chain(*block_tables))
         block_mapping = [[i] * bu for i, bu in enumerate(blocks_used)]
         block_mapping = list(itertools.chain(*block_mapping))
 
-        for sl, bu in zip(seq_lens, blocks_used):
-            for i in range(bu):
-                block_masks.append([i * self.block_size + j >= sl for j in range(self.block_size)])
         ignored_block = [True] * self.block_size
+        full_block = [False] * self.block_size
+        for s in seq_lens:
+            full = s // self.block_size
+            rest = s % self.block_size
+            block_masks.extend(full_block for _ in range(full))
+            if rest > 0:
+                block_masks.append([False] * rest + [True] * (self.block_size - rest))
 
         block_bucket_size = self.decode_block_bucket_cfg[1]
         block_list = pad_list(block_list, block_bucket_size, _PAD_SLOT_ID)
@@ -641,7 +639,7 @@ class HabanaModelRunner:
             block_mapping=block_mapping,
             block_masks=block_masks,
             attn_bias=None,
-            seq_lens_tensor=seq_lens_tensor,
+            seq_lens_tensor=None,
         )
         return PrepareDecodeMetadata(
             input_tokens=input_tokens,
@@ -881,7 +879,7 @@ class HabanaModelRunner:
         else:
             model_event_name = 'model_executable'
         free_mem = format_bytes(HabanaMemoryProfiler.current_free_device_memory())
-        print(model_event_name, free_mem, count_hpu_graphs(), use_graphs)
+        #print(model_event_name, free_mem, count_hpu_graphs(), use_graphs)
         with self.profiler.record_event('internal', model_event_name):
             hidden_states = self.model.forward(**execute_model_kwargs, selected_token_indices=sampling_metadata.selected_token_indices, bypass_hpu_graphs=not use_graphs)
 
@@ -961,8 +959,8 @@ class HabanaModelRunner:
             seqs = [self.create_dummy_seq_group_metadata(i, seq_len, is_prompt) for i in range(batch_size)]
         else:
             # FIXME: seq_len is actually number of blocks
-            blocks = [1 for _ in range(batch_size - 1)]
-            blocks = blocks + [seq_len - len(blocks)]
+            blocks = [seq_len // batch_size for _ in range(batch_size)]
+            blocks[0] += seq_len % batch_size
             seqs = [self.create_dummy_seq_group_metadata(i, b * self.block_size, is_prompt) for i, b in enumerate(blocks)]
         torch.hpu.synchronize()
         profiler = None
