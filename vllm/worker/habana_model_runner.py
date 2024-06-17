@@ -174,7 +174,7 @@ class HpuModelAdapter():
                          .masked_fill_(mask, -math.inf))
             #FIXME: Restore sliding window support
             #if self.sliding_window is not None:
-            prefill_metadata = replace(prefill_metadata, attn_bias=attn_bias)
+            prefill_metadata = prefill_metadata._replace(attn_bias=attn_bias)
             attn_metadata = attn_metadata._replace(prefill_metadata=prefill_metadata)
             return attn_metadata
         else:
@@ -819,12 +819,18 @@ class HabanaModelRunner:
             return attn_metadata.decode_metadata.block_list.numel()
 
     def trim_attn_metadata(self, metadata: AttentionMetadata) -> object:
+        prefill_metadata = subtuple(metadata.prefill_metadata,
+                                    "TrimmedPrefillMetadata",
+                                    ['attn_bias', 'seq_lens_tensor'])
+        decode_metadata = subtuple(metadata.decode_metadata,
+                                    "TrimmedDecodeMetadata",
+                                    ['block_list', 'block_mapping', 'block_masks'])
         return subtuple(metadata,
                         'TrimmedMetadata',
                         ['slot_mapping',
-                         'kv_cache_dtype',
-                         'prefill_metadata',
-                         'decode_metadata'])
+                         'kv_cache_dtype'],
+                        {'prefill_metadata': prefill_metadata,
+                         'decode_metadata': decode_metadata})
 
 
     @torch.inference_mode()
@@ -872,12 +878,6 @@ class HabanaModelRunner:
         else:
             model_event_name = 'model_executable'
         free_mem = format_bytes(HabanaMemoryProfiler.current_free_device_memory())
-        print(htorch.hpu.input_hash(execute_model_kwargs['attn_metadata']))
-        print(htorch.hpu.input_hash(execute_model_kwargs['attn_metadata'].slot_mapping))
-        print(htorch.hpu.input_hash(execute_model_kwargs['attn_metadata'].kv_cache_dtype))
-        print(htorch.hpu.input_hash(execute_model_kwargs['attn_metadata'].prefill_metadata))
-        print(htorch.hpu.input_hash(execute_model_kwargs['attn_metadata'].decode_metadata))
-        print(execute_model_kwargs['attn_metadata'].decode_metadata)
         print(model_event_name, free_mem, count_hpu_graphs(), use_graphs)
         with self.profiler.record_event('internal', model_event_name):
             hidden_states = self.model.forward(**execute_model_kwargs, selected_token_indices=sampling_metadata.selected_token_indices, bypass_hpu_graphs=not use_graphs)
@@ -951,7 +951,6 @@ class HabanaModelRunner:
 
     def warmup_scenario(self, batch_size, seq_len, is_prompt, kv_caches, profile = False) -> None:
         use_graphs = self._use_graphs(batch_size, seq_len, is_prompt)
-        print('use_graphs:', use_graphs)
         scenario_name = f"warmup_{'prompt' if is_prompt else 'decode'}_bs{batch_size}_seq{seq_len}_graphs{'T' if use_graphs else 'F'}"
         self.profiler.start('internal', scenario_name)
         times = 3 if use_graphs or profile else 1
@@ -1048,8 +1047,8 @@ class HabanaModelRunner:
 
         start_mem = HabanaMemoryProfiler.current_device_memory_usage()
         start_time = time.perf_counter()
-        self.warmup_all_buckets(self.decode_buckets, False, kv_caches)
         self.warmup_all_buckets(self.prompt_buckets, True, kv_caches)
+        self.warmup_all_buckets(self.decode_buckets, False, kv_caches)
 
         if not self.enforce_eager:
             mem_margin = 1.0 - float(os.environ.get('VLLM_GRAPH_MEM_MARGIN', '0.02'))
