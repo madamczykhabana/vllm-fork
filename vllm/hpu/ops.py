@@ -49,24 +49,23 @@ def block_softmax(batch_size, attn, block_mapping):
 
 
 @hpu_utils.with_mark_steps
-def flat_pa(query, key_cache, value_cache, block_list, block_mapping, block_masks, scale):
+def flat_pa(query, key_cache, value_cache, block_list, block_mapping, block_bias, scale):
     batch_size = query.size(0)
     q_heads = query.size(1)
     kv_heads = key_cache.size(2)
     query = scale * torch.index_select(query, 0, block_mapping).unsqueeze(-2)
     key = torch.index_select(key_cache, 0, block_list).permute(0, 2, 3, 1)
     value = torch.index_select(value_cache, 0, block_list).transpose(1, 2)
-    block_masks = block_masks.view(key.size(0), 1, 1, -1)
+    block_bias = block_bias.view(key.size(0), 1, 1, -1)
 
     if kv_heads != q_heads:
         query = query.unflatten(1, (kv_heads, -1))
         key = key.unflatten(1, (kv_heads, 1))
         value = value.unflatten(1, (kv_heads, 1))
-        block_masks = block_masks.unsqueeze(1)
+        block_bias = block_bias.unsqueeze(1)
 
-    min_inf = torch.finfo(query.dtype).min
     attn = query @ key
-    attn.masked_fill_(block_masks, min_inf)
+    attn.add_(block_bias)
     attn = block_softmax(batch_size, attn, block_mapping)
     attn = attn @ value
     attn = block_reduce(batch_size, attn, block_mapping)

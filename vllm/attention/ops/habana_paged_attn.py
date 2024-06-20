@@ -18,7 +18,7 @@ class HabanaPagedAttentionMetadata:
     """Metadata for PagedAttention."""
     block_list: Optional[torch.Tensor]
     block_mapping: Optional[torch.Tensor]
-    block_masks: Optional[torch.Tensor]
+    block_bias: Optional[torch.Tensor]
 
 
 class HabanaPagedAttention:

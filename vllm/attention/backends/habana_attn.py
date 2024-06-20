@@ -187,7 +187,7 @@ class HabanaAttentionImpl(AttentionImpl):
                 value_cache=value_cache,
                 block_list=decode_meta.block_list,
                 block_mapping=decode_meta.block_mapping,
-                block_masks=decode_meta.block_masks,
+                block_bias=decode_meta.block_bias,
                 scale=self.scale,
             )
 

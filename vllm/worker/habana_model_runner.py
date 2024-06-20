@@ -530,7 +530,7 @@ class HabanaModelRunner:
         attn_metadata = self.attn_backend.make_metadata(
             block_list=None,
             block_mapping=None,
-            block_masks=None,
+            block_bias=None,
             attn_bias=None,
             seq_lens_tensor=seq_lens_tensor,
         )
@@ -611,33 +611,33 @@ class HabanaModelRunner:
                                     device=self.device)
 
         blocks_used = list(itertools.chain(round_up(s, self.block_size) // self.block_size for s in seq_lens))
-        block_masks = []
+        block_bias = []
         block_list = list(itertools.chain(*block_tables))
         block_mapping = [[i] * bu for i, bu in enumerate(blocks_used)]
         block_mapping = list(itertools.chain(*block_mapping))
 
-        ignored_block = [True] * self.block_size
-        full_block = [False] * self.block_size
+        ignored_block = [-math.inf] * self.block_size
+        full_block = [0] * self.block_size
         for s in seq_lens:
             full = s // self.block_size
             rest = s % self.block_size
-            block_masks.extend(full_block for _ in range(full))
+            block_bias.extend(full_block for _ in range(full))
             if rest > 0:
-                block_masks.append([False] * rest + [True] * (self.block_size - rest))
+                block_bias.append([0] * rest + [-math.inf] * (self.block_size - rest))
 
         block_bucket_size = self.decode_block_bucket_cfg[1]
         block_list = pad_list(block_list, block_bucket_size, _PAD_SLOT_ID)
         block_mapping = pad_list(block_mapping, block_bucket_size, 0)
-        block_masks = pad_list(block_masks, block_bucket_size, ignored_block)
+        block_bias = pad_list(block_bias, block_bucket_size, ignored_block)
 
         block_list = torch.tensor(block_list, dtype=torch.int, device=self.device)
         block_mapping = torch.tensor(block_mapping, dtype=torch.int, device=self.device)
-        block_masks = torch.tensor(block_masks, dtype=torch.bool, device=self.device).view(-1, self.block_size)
+        block_bias = torch.tensor(block_bias, dtype=torch.bfloat16, device=self.device).view(-1, self.block_size)
 
         attn_metadata = self.attn_backend.make_metadata(
             block_list=block_list,
             block_mapping=block_mapping,
-            block_masks=block_masks,
+            block_bias=block_bias,
             attn_bias=None,
             seq_lens_tensor=None,
         )
@@ -825,7 +825,7 @@ class HabanaModelRunner:
                                     ['attn_bias', 'seq_lens_tensor'])
         decode_metadata = subtuple(metadata.decode_metadata,
                                     "TrimmedDecodeMetadata",
-                                    ['block_list', 'block_mapping', 'block_masks'])
+                                    ['block_list', 'block_mapping', 'block_bias'])
         return subtuple(metadata,
                         'TrimmedMetadata',
                         ['slot_mapping',
