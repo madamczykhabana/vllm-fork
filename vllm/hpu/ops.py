@@ -34,41 +34,51 @@ def gelu_fast(output, input):
     raise NotImplementedError
 
 
-def block_reduce(batch_size, tensor, block_mapping):
-    sums = torch.zeros(batch_size, *tensor.shape[1:], dtype=tensor.dtype, device=tensor.device)
-    sums.index_put_((block_mapping,), tensor, accumulate=True)
-    return sums
+def batch2block(tensor, block_mapping):
+    shape = tuple(tensor.shape)
+    return (block_mapping.t() @ tensor.view(shape[0], -1)).view(-1, *shape[1:])
+
+
+def block2batch(tensor, block_mapping):
+    shape = tuple(tensor.shape)
+    return (block_mapping @ tensor.view(shape[0], -1)).view(-1, *shape[1:])
 
 
 def block_softmax(batch_size, attn, block_mapping):
     attn = attn.exp_()
-    sums = block_reduce(batch_size, attn.sum(dim=-1).unsqueeze(-1), block_mapping)
-    sums = torch.index_select(sums, 0, block_mapping)
+    sums = attn.sum(dim=-1).unsqueeze(-1)
+    sums = block2batch(sums, block_mapping)
+    sums = batch2block(sums, block_mapping)
     attn.div_(sums)
     return attn
 
 
-@hpu_utils.with_mark_steps
+#@hpu_utils.with_mark_steps
 def flat_pa(query, key_cache, value_cache, block_list, block_mapping, block_bias, scale):
     batch_size = query.size(0)
     q_heads = query.size(1)
     kv_heads = key_cache.size(2)
-    query = scale * torch.index_select(query, 0, block_mapping).unsqueeze(-2)
-    key = torch.index_select(key_cache, 0, block_list).permute(0, 2, 3, 1)
-    value = torch.index_select(value_cache, 0, block_list).transpose(1, 2)
+
+    query = batch2block(scale * query, block_mapping).unsqueeze(-2)
+    key = torch.index_select(key_cache, 0, block_list)
+    value = torch.index_select(value_cache, 0, block_list)
     block_bias = block_bias.view(key.size(0), 1, 1, -1)
 
     if kv_heads != q_heads:
         query = query.unflatten(1, (kv_heads, -1))
-        key = key.unflatten(1, (kv_heads, 1))
-        value = value.unflatten(1, (kv_heads, 1))
+        key = key.unflatten(2, (kv_heads, 1))
+        value = value.unflatten(2, (kv_heads, 1))
         block_bias = block_bias.unsqueeze(1)
+        key = key.permute(0, 2, 3, 4, 1)
+        value = value.permute(0, 2, 3, 1, 4)
+    else:
+        key = key.permute(0, 2, 3, 1)
+        value = value.permute(0, 2, 1, 3)
 
-    attn = query @ key
-    attn.add_(block_bias)
+    attn = (query @ key) + block_bias
     attn = block_softmax(batch_size, attn, block_mapping)
     attn = attn @ value
-    attn = block_reduce(batch_size, attn, block_mapping)
+    attn = block2batch(attn, block_mapping)
     attn = attn.squeeze(-2)
     if kv_heads != q_heads:
         attn = attn.flatten(1, 2)
