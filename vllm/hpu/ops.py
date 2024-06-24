@@ -54,10 +54,13 @@ def block_softmax(batch_size, attn, block_mapping):
 
 
 #@hpu_utils.with_mark_steps
-def flat_pa(query, key_cache, value_cache, block_list, block_mapping, block_bias, scale):
+def flat_pa(query, key_cache, value_cache, block_list, block_mapping, block_bias, scale, flipped):
     batch_size = query.size(0)
     q_heads = query.size(1)
-    kv_heads = key_cache.size(2)
+    if flipped:
+        kv_heads = key_cache.size(2)
+    else:
+        kv_heads = key_cache.size(1)
 
     query = batch2block(scale * query, block_mapping).unsqueeze(-2)
     key = torch.index_select(key_cache, 0, block_list)
@@ -66,14 +69,19 @@ def flat_pa(query, key_cache, value_cache, block_list, block_mapping, block_bias
 
     if kv_heads != q_heads:
         query = query.unflatten(1, (kv_heads, -1))
-        key = key.unflatten(2, (kv_heads, 1))
-        value = value.unflatten(2, (kv_heads, 1))
         block_bias = block_bias.unsqueeze(1)
-        key = key.permute(0, 2, 3, 4, 1)
-        value = value.permute(0, 2, 3, 1, 4)
+        if flipped:
+            key = key.unflatten(2, (kv_heads, 1))
+            value = value.unflatten(2, (kv_heads, 1))
+            key = key.permute(0, 2, 3, 4, 1)
+            value = value.permute(0, 2, 3, 1, 4)
+        else:
+            key = key.unflatten(1, (kv_heads, 1))
+            value = value.unflatten(1, (kv_heads, 1))
     else:
-        key = key.permute(0, 2, 3, 1)
-        value = value.permute(0, 2, 1, 3)
+        if flipped:
+            key = key.permute(0, 2, 3, 1)
+            value = value.permute(0, 2, 1, 3)
 
     attn = (query @ key) + block_bias
     attn = block_softmax(batch_size, attn, block_mapping)
