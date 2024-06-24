@@ -53,7 +53,7 @@ def block_softmax(batch_size, attn, block_mapping):
     return attn
 
 
-#@hpu_utils.with_mark_steps
+@hpu_utils.with_mark_steps
 def flat_pa(query, key_cache, value_cache, block_list, block_mapping, block_bias, scale, flipped=True):
     batch_size = query.size(0)
     q_heads = query.size(1)
