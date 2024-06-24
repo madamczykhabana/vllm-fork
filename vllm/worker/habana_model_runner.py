@@ -153,35 +153,31 @@ class HpuModelAdapter():
     def __init__(self, model):
         self.model = model
 
-    def _set_attn_bias(self, attn_metadata, batch_size, seq_len, device, dtype):
-        prefill_metadata = attn_metadata.prefill_metadata
-        if prefill_metadata is None:
-            return attn_metadata
-        #FIXME: Restore alibi support
-        #if self.alibi_slopes is None:
-        if True:
-            seq_lens_t = prefill_metadata.seq_lens_tensor
-            len_mask = (torch.arange(0, seq_len, device=device, dtype=torch.int32)
-                        .view(1, seq_len)
-                        .ge(seq_lens_t.unsqueeze(-1))
-                        .view(batch_size, 1, 1, seq_len))
-            causal_mask = torch.triu(
-                torch.ones((batch_size, 1, seq_len, seq_len), device=device, dtype=torch.bool),
-                diagonal=1
-            )
-            mask = causal_mask.logical_or(len_mask)
-            attn_bias = (torch.zeros_like(mask, dtype=dtype)
-                         .masked_fill_(mask, -math.inf))
-            #FIXME: Restore sliding window support
-            #if self.sliding_window is not None:
-            prefill_metadata = prefill_metadata._replace(attn_bias=attn_bias)
-            attn_metadata = attn_metadata._replace(prefill_metadata=prefill_metadata)
-            return attn_metadata
+    def _set_attn_bias(self, metadata, batch_size, seq_len, device, dtype):
+        seq_lens_t = metadata.seq_lens_tensor
+        len_mask = (torch.arange(0, seq_len, device=device, dtype=torch.int32)
+                    .view(1, seq_len)
+                    .ge(seq_lens_t.unsqueeze(-1))
+                    .view(batch_size, 1, 1, seq_len))
+        causal_mask = torch.triu(
+            torch.ones((batch_size, 1, seq_len, seq_len), device=device, dtype=torch.bool),
+            diagonal=1
+        )
+        mask = causal_mask.logical_or(len_mask)
+        attn_bias = (torch.zeros_like(mask, dtype=dtype)
+                        .masked_fill_(mask, -math.inf))
+        return metadata._replace(attn_bias=attn_bias)
+
+    def _set_block_mapping(self, metadata, batch_size, dtype):
+        return metadata._replace(block_mapping=torch.nn.functional.one_hot(metadata.block_mapping, num_classes=batch_size).to(dtype))
+
+    def _update_metadata(self, attn_metadata, batch_size, seq_len, device, dtype):
+        if (meta := attn_metadata.prefill_metadata) is not None:
+            return attn_metadata._replace(prefill_metadata=self._set_attn_bias(meta, batch_size, seq_len, device, dtype))
+        elif (meta := attn_metadata.decode_metadata) is not None:
+            return attn_metadata._replace(decode_metadata=self._set_block_mapping(meta, batch_size, dtype))
         else:
-            # FIXME: This needs updating...
-            prefill_meta.attn_bias = _make_alibi_bias(
-                self.alibi_slopes, self.num_kv_heads, batch_size,
-                seq_len, query.dtype)
+            return attn_metadata
 
     def forward(self, *args, **kwargs):
         kwargs = kwargs.copy()
@@ -189,7 +185,7 @@ class HpuModelAdapter():
         if 'bypass_hpu_graphs' in kwargs:
             kwargs.pop('bypass_hpu_graphs') # required for PT eager
         input_ids = kwargs['input_ids']
-        kwargs['attn_metadata'] = self._set_attn_bias(kwargs['attn_metadata'], input_ids.size(0), input_ids.size(1), input_ids.device, torch.bfloat16)
+        kwargs['attn_metadata'] = self._update_metadata(kwargs['attn_metadata'], input_ids.size(0), input_ids.size(1), input_ids.device, torch.bfloat16)
         hidden_states = self.model(*args, **kwargs)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         hidden_states = hidden_states.index_select(0, selected_token_indices)

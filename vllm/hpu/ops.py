@@ -36,12 +36,12 @@ def gelu_fast(output, input):
 
 def batch2block(tensor, block_mapping):
     shape = tuple(tensor.shape)
-    return (block_mapping.t() @ tensor.view(shape[0], -1)).view(-1, *shape[1:])
+    return (block_mapping @ tensor.view(shape[0], -1)).view(-1, *shape[1:])
 
 
 def block2batch(tensor, block_mapping):
     shape = tuple(tensor.shape)
-    return (block_mapping @ tensor.view(shape[0], -1)).view(-1, *shape[1:])
+    return (block_mapping.t() @ tensor.view(shape[0], -1)).view(-1, *shape[1:])
 
 
 def block_softmax(batch_size, attn, block_mapping):
@@ -54,7 +54,7 @@ def block_softmax(batch_size, attn, block_mapping):
 
 
 #@hpu_utils.with_mark_steps
-def flat_pa(query, key_cache, value_cache, block_list, block_mapping, block_bias, scale, flipped):
+def flat_pa(query, key_cache, value_cache, block_list, block_mapping, block_bias, scale, flipped=True):
     batch_size = query.size(0)
     q_heads = query.size(1)
     if flipped:

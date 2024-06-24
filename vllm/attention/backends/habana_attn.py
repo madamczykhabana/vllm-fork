@@ -149,36 +149,18 @@ class HabanaAttentionImpl(AttentionImpl):
 
         if prefill_meta := attn_metadata.prefill_metadata:
             # Prompt run.
-            # FIXME!
-            if True:
-                # TODO: move this outside of model
-                assert prefill_meta.attn_bias is not None, 'attn_bias must be set before calling model.forward!'
-                query_shape = (batch_size, seq_len, self.num_heads, self.head_size)
-                kv_shape = (batch_size, seq_len_kv, self.num_kv_heads, self.head_size)
-                out = xops.prompt_attention(
-                    query.view(query_shape),
-                    key.view(kv_shape),
-                    value.view(kv_shape),
-                    attn_bias=prefill_meta.attn_bias,
-                    p=0.0,
-                    scale=self.scale,
-                )
-                output = out.reshape(batch_size, seq_len, hidden_size)
-            else:
-                # prefix-enabled attention
-                output = HabanaPagedAttention.forward_prefix(
-                    query,
-                    key,
-                    value,
-                    key_cache,
-                    value_cache,
-                    prefill_meta.block_tables,
-                    prefill_meta.subquery_start_loc,
-                    prefill_meta.seq_lens_tensor,
-                    prefill_meta.context_lens_tensor,
-                    prefill_meta.max_query_len,
-                    self.alibi_slopes,
-                )
+            assert prefill_meta.attn_bias is not None, 'attn_bias must be set before calling model.forward!'
+            query_shape = (batch_size, seq_len, self.num_heads, self.head_size)
+            kv_shape = (batch_size, seq_len_kv, self.num_kv_heads, self.head_size)
+            out = xops.prompt_attention(
+                query.view(query_shape),
+                key.view(kv_shape),
+                value.view(kv_shape),
+                attn_bias=prefill_meta.attn_bias,
+                p=0.0,
+                scale=self.scale,
+            )
+            output = out.reshape(batch_size, seq_len, hidden_size)
         if decode_meta := attn_metadata.decode_metadata:
             # Decoding run.
             output = HabanaPagedAttention.forward_decode(
