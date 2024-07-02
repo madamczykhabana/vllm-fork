@@ -984,7 +984,7 @@ class HabanaModelRunner:
             profiler.start()
         self.profiler.start('internal', scenario_name)
         for _ in range(times):
-            self.execute_model(seqs, kv_caches, warmup_mode=True)
+            self.execute_model(seqs, kv_caches, warmup_mode=False)
             torch.hpu.synchronize()
             if profiler:
                 profiler.step()
