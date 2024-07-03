@@ -272,11 +272,6 @@ class BatchType(IntEnum):
     MIXED = 2
 
 
-@dataclass(unsafe_hash=True)
-class HashableAttentionMetadata(AttentionMetadata):
-    ...
-
-
 class HabanaModelRunner:
 
     def __init__(
@@ -828,7 +823,7 @@ class HabanaModelRunner:
                 decode_attn_metadata = self.attn_backend.make_metadata(
                     **metadata_dict)
 
-        attn_metadata = HashableAttentionMetadata(
+        attn_metadata = AttentionMetadata(
             num_prefills=num_prefills,
             slot_mapping=slot_mapping,
             num_prefill_tokens=num_prefill_tokens,
