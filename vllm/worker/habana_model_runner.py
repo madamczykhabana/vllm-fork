@@ -52,9 +52,17 @@ def subtuple(obj: object, typename: str, to_copy: List[str], to_override: Dict[s
     return _TYPE_CACHE[typename](**values)
 
 
+def split_to_blocks(length, block_size):
+    while length > 0:
+        chunk = min(length, block_size)
+        length -= chunk
+        yield chunk
+
+
 def count_hpu_graphs():
     import glob
     return len(glob.glob('.graph_dumps/*PreGraph*'))
+
 
 def setup_profiler():
     DEVICE='hpu'
@@ -73,7 +81,8 @@ def setup_profiler():
         record_shapes=False,
         with_stack=True)
     return profiler
- 
+
+
 # Read bucketing configuration from env variables
 # phase is either 'prompt' or 'decode'
 # dim is either 'bs' or 'blocks'
@@ -92,6 +101,7 @@ def warmup_range(config: Tuple[int, int, int]):
     ramp_up = itertools.takewhile(lambda x: x < bstep and x <= bmax, ramp_up)
     stable = range(max(bmin, bstep), bmax + 1, bstep)
     return list(ramp_up) + list(stable)
+
 
 def generate_prompt_buckets(bs_bucket_config, seq_bucket_config):
     buckets = itertools.product(warmup_range(bs_bucket_config), warmup_range(seq_bucket_config))
@@ -123,7 +133,7 @@ def round_up(value: int, k: int):
 
 
 def find_bucket(value: int, config: Tuple[int, int, int]):
-    bmin, bstep, bmax = config
+    _, bstep, _ = config
     if value < bstep:
         result = min(next_pow2(value), bstep)
     else:
@@ -166,14 +176,20 @@ class HpuModelAdapter():
                         .masked_fill_(mask, -math.inf))
         return metadata._replace(attn_bias=attn_bias)
 
-    def _set_block_mapping(self, metadata, batch_size, dtype):
-        return metadata._replace(block_mapping=torch.nn.functional.one_hot(metadata.block_mapping, num_classes=batch_size).to(dtype))
+    def _set_block_mapping(self, metadata, batch_size, block_size, device, dtype):
+        mask = torch.arange(0, block_size, device=device, dtype=torch.int32).unsqueeze(0)
+        mask = mask >= metadata.block_usage.unsqueeze(-1)
+        attn_bias = (torch.zeros_like(mask, dtype=dtype)
+                        .masked_fill_(mask, -math.inf))
+        block_mapping = torch.nn.functional.one_hot(metadata.block_mapping, num_classes=batch_size).to(dtype)
+        metadata = metadata._replace(block_mapping=block_mapping, attn_bias=attn_bias)
+        return metadata
 
-    def _update_metadata(self, attn_metadata, batch_size, seq_len, device, dtype):
+    def _update_metadata(self, attn_metadata, batch_size, seq_len, block_size, device, dtype):
         if (meta := attn_metadata.prefill_metadata) is not None:
             return attn_metadata._replace(prefill_metadata=self._set_attn_bias(meta, batch_size, seq_len, device, dtype))
         elif (meta := attn_metadata.decode_metadata) is not None:
-            return attn_metadata._replace(decode_metadata=self._set_block_mapping(meta, batch_size, dtype))
+            return attn_metadata._replace(decode_metadata=self._set_block_mapping(meta, batch_size, block_size, device, dtype))
         else:
             return attn_metadata
 
@@ -183,7 +199,7 @@ class HpuModelAdapter():
         if 'warmup_mode' in kwargs:
             kwargs.pop('warmup_mode') # required for PT eager
         input_ids = kwargs['input_ids']
-        kwargs['attn_metadata'] = self._update_metadata(kwargs['attn_metadata'], input_ids.size(0), input_ids.size(1), input_ids.device, torch.bfloat16)
+        kwargs['attn_metadata'] = self._update_metadata(kwargs['attn_metadata'], input_ids.size(0), input_ids.size(1), 128, input_ids.device, torch.bfloat16)
         hidden_states = self.model(*args, **kwargs)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         hidden_states = hidden_states.index_select(0, selected_token_indices)
@@ -513,7 +529,6 @@ class HabanaModelRunner:
         else:
             multi_modal_input = None
 
-        max_prompt_block_table_len = max(len(t) for t in prefix_block_tables)
         max_prompt_len = max(find_bucket(max(seq_lens), self.prompt_seq_bucket_cfg), self.block_size)
 
         input_tokens = make_tensor_with_pad(input_tokens,
@@ -541,7 +556,7 @@ class HabanaModelRunner:
         attn_metadata = self.attn_backend.make_metadata(
             block_list=None,
             block_mapping=None,
-            block_bias=None,
+            block_usage=None,
             attn_bias=None,
             seq_lens_tensor=seq_lens_tensor,
         )
@@ -579,15 +594,15 @@ class HabanaModelRunner:
             assert seq_group_metadata.token_chunk_size == 1
 
             seq_ids = list(seq_group_metadata.seq_data.keys())
-            lora_id = seq_group_metadata.lora_int_id
+            #lora_id = seq_group_metadata.lora_int_id
 
-            if lora_id > 0:
-                lora_requests.add(seq_group_metadata.lora_request)
+            #if lora_id > 0:
+            #    lora_requests.add(seq_group_metadata.lora_request)
 
             for seq_id in seq_ids:
                 seq_data = seq_group_metadata.seq_data[seq_id]
                 generation_token = seq_data.get_last_token_id()
-                input_tokens.append([generation_token])
+                input_tokens.append(generation_token)
 
                 seq_len = seq_data.get_len()
                 position = seq_len - 1
@@ -602,8 +617,8 @@ class HabanaModelRunner:
                 block_offset = position % self.block_size
                 slot = block_number * self.block_size + block_offset
                 slot_mapping.append([slot])
-                lora_index_mapping.append(lora_id)
-                lora_prompt_mapping.append(lora_id)
+                #lora_index_mapping.append(lora_id)
+                #lora_prompt_mapping.append(lora_id)
 
                 if self.sliding_window is not None:
                     sliding_window_blocks = (self.sliding_window //
@@ -611,44 +626,47 @@ class HabanaModelRunner:
                     block_table = block_table[-sliding_window_blocks:]
                 block_tables.append(block_table)
 
+        #with torch.autograd.profiler.record_function("t:input_tokens"):
         input_tokens = torch.tensor(input_tokens,
                                     dtype=torch.long,
-                                    device=self.device)
+                                    device=self.device).unsqueeze(-1)
+        #with torch.autograd.profiler.record_function("t:input_positions"):
         input_positions = torch.tensor(input_positions,
-                                       dtype=torch.long,
-                                       device=self.device)
+                                    dtype=torch.long,
+                                    device=self.device)
+        #with torch.autograd.profiler.record_function("t:slot_mapping"):
         slot_mapping = torch.tensor(slot_mapping,
                                     dtype=torch.long,
                                     device=self.device)
 
+
+        #with torch.autograd.profiler.record_function("create lists"):
         blocks_used = list(itertools.chain(round_up(s, self.block_size) // self.block_size for s in seq_lens))
-        block_bias = []
         block_list = list(itertools.chain(*block_tables))
         block_mapping = [[i] * bu for i, bu in enumerate(blocks_used)]
         block_mapping = list(itertools.chain(*block_mapping))
+        block_usage = [split_to_blocks(sl, self.block_size) for sl in seq_lens]
+        block_usage = list(itertools.chain(*block_usage))
+        #print(blocks_used)
+        #print(block_usage)
 
-        ignored_block = [-math.inf] * self.block_size
-        full_block = [0] * self.block_size
-        for s in seq_lens:
-            full = s // self.block_size
-            rest = s % self.block_size
-            block_bias.extend(full_block for _ in range(full))
-            if rest > 0:
-                block_bias.append([0] * rest + [-math.inf] * (self.block_size - rest))
-
+        #with torch.autograd.profiler.record_function("pad lists"):
         block_bucket_size = self.decode_block_bucket_cfg[1]
         block_list = pad_list(block_list, block_bucket_size, _PAD_SLOT_ID)
         block_mapping = pad_list(block_mapping, block_bucket_size, 0)
-        block_bias = pad_list(block_bias, block_bucket_size, ignored_block)
+        block_usage = pad_list(block_usage, block_bucket_size, 0)
 
+        #with torch.autograd.profiler.record_function("t:block_list"):
         block_list = torch.tensor(block_list, dtype=torch.int, device=self.device)
+        #with torch.autograd.profiler.record_function("t:block_mapping"):
         block_mapping = torch.tensor(block_mapping, dtype=torch.int, device=self.device)
-        block_bias = torch.tensor(block_bias, dtype=torch.bfloat16, device=self.device).view(-1, self.block_size)
+        #with torch.autograd.profiler.record_function("t:block_usage"):
+        block_usage = torch.tensor(block_usage, dtype=torch.bfloat16, device=self.device)
 
         attn_metadata = self.attn_backend.make_metadata(
             block_list=block_list,
             block_mapping=block_mapping,
-            block_bias=block_bias,
+            block_usage=block_usage,
             attn_bias=None,
             seq_lens_tensor=None,
         )
@@ -836,7 +854,7 @@ class HabanaModelRunner:
                                     ['attn_bias', 'seq_lens_tensor'])
         decode_metadata = subtuple(metadata.decode_metadata,
                                     "TrimmedDecodeMetadata",
-                                    ['block_list', 'block_mapping', 'block_bias'])
+                                    ['attn_bias', 'block_list', 'block_mapping', 'block_usage'])
         return subtuple(metadata,
                         'TrimmedMetadata',
                         ['slot_mapping',
@@ -894,7 +912,7 @@ class HabanaModelRunner:
             model_event_name = f"model_{'prompt' if is_prompt else 'decode'}_bs{batch_size}_seq{seq_len}_graphs{'T' if use_graphs else 'F'}"
         else:
             model_event_name = 'model_executable'
-        free_mem = format_bytes(HabanaMemoryProfiler.current_free_device_memory())
+        #free_mem = format_bytes(HabanaMemoryProfiler.current_free_device_memory())
         #print(model_event_name, free_mem, count_hpu_graphs(), use_graphs)
         with self.profiler.record_event('internal', model_event_name):
             hidden_states = self.model.forward(**execute_model_kwargs, selected_token_indices=sampling_metadata.selected_token_indices)

@@ -178,7 +178,7 @@ class HabanaAttentionImpl(AttentionImpl, torch.nn.Module):
                 value_cache=value_cache,
                 block_list=decode_meta.block_list,
                 block_mapping=decode_meta.block_mapping,
-                block_bias=decode_meta.block_bias,
+                block_bias=decode_meta.attn_bias,
                 scale=self.scale,
                 qk_matmul_op=self.qk_matmul,
                 kv_matmul_op=self.kv_matmul,
