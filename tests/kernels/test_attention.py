@@ -129,7 +129,6 @@ def ref_single_query_cached_kv_attention(
         output[i].copy_(out, non_blocking=True)
 
 
-@pytest.mark.skipif(is_hpu(), reason="Skipping test on HPU")
 @pytest.mark.parametrize("version", ["v1", "v2"])
 @pytest.mark.parametrize("num_seqs", NUM_GEN_SEQS)
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
