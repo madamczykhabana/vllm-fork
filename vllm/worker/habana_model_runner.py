@@ -1104,7 +1104,7 @@ class HabanaModelRunner:
         self.warmup_scenario(max_batch_size, max_seq_len, True, kv_caches)
 
     def warmup_scenario(self, batch_size, seq_len, is_prompt, kv_caches, profile = False) -> None:
-        use_graphs = self._use_graphs(batch_size, seq_len, is_prompt)
+        use_graphs = self._use_graphs(batch_size, seq_len, is_prompt) if not self.skip_warmup else False
         scenario_name = f"warmup_{'prompt' if is_prompt else 'decode'}_bs{batch_size}_seq{seq_len}_graphs{'T' if use_graphs else 'F'}"
         self.profiler.start('internal', scenario_name)
         times = 3 if use_graphs or profile else 1
